@@ -39,7 +39,7 @@ class PaperTrader:
             self.strategies[symbol] = BollingerRSIStrategy(
                 symbol=symbol,
                 interval=INTERVAL,
-                use_strict_filter=cfg.bot.use_strict_rsi,
+                use_strict_filter=cfg.bot.use_strict_rsi, debug=True,
             )
             self._candles[symbol] = deque(maxlen=MAX_CANDLES)
         self._load_state()
