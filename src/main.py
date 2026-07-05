@@ -278,6 +278,7 @@ class BCtrl:
                         self._on_kline(msg)
             except Exception as e:
                 logger.error(f"Poll error: {e}")
+            logger.info("Poll tick: checking for new candles")
             time.sleep(POLL_SEC)
 
     def _on_kline(self, msg):
