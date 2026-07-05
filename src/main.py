@@ -356,7 +356,7 @@ class BotController:
         logger.info(f"WS msg received")
         if not self.running:
             return
-        kline = msg.get("k", msg.get("data", {}).get("k", {}))
+        kline = msg.get("k", {})
         symbol = kline.get("s", "")
         if symbol not in self.candles:
             return
