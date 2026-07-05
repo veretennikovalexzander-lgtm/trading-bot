@@ -1,12 +1,12 @@
-﻿# Trading Bot (Binance)
+# Trading Bot (Binance)
 
 Автоматизированный торговый бот для криптовалютной биржи [Binance](https://www.binance.com/).
 
 ## Технологии
 
-- **Python** — язык разработки
-- **PostgreSQL 16** — база данных для хранения сделок, ордеров, рыночных данных
-- **Docker** — контейнеризация PostgreSQL и pgAdmin
+- **Python 3.11+** — язык разработки
+- **PostgreSQL 16** — база данных
+- **DBeaver** — GUI для работы с БД
 - **python-binance** — официальная библиотека Binance API
 
 ## Быстрый старт
@@ -14,48 +14,56 @@
 ### 1. Клонирование
 
 ```bash
-git clone <repo-url>
-cd Проект-Бот
+git clone git@github.com:veretennikovalexzander-lgtm/trading-bot.git
+cd trading-bot
 ```
 
-### 2. Настройка переменных окружения
+### 2. Установка PostgreSQL
+
+Скачай и установи [PostgreSQL 16](https://www.enterprisedb.com/downloads/postgresql-postgresql-downloads).
+
+При установке задай:
+- Пароль для `postgres`: `changeme`
+- Порт: `5432`
+
+После установки создай базу и пользователя через **DBeaver** или **pgAdmin**:
+
+```sql
+CREATE USER bot_user WITH PASSWORD 'changeme';
+CREATE DATABASE trading_bot OWNER bot_user;
+```
+
+Затем импортируй схему:
+
+```bash
+psql -U bot_user -d trading_bot -f sql/init.sql
+```
+*(или открой `sql/init.sql` в DBeaver и выполни)*
+
+### 3. Настройка переменных окружения
 
 ```bash
 cp .env.example .env
-# Отредактируй .env — вставь свои API-ключи Binance и пароли БД
+# Отредактируй .env — вставь свои API-ключи Binance
 ```
-
-### 3. Запуск PostgreSQL
-
-```bash
-docker compose up -d
-```
-
-После запуска:
-- **PostgreSQL** доступен на `localhost:5432`
-- **pgAdmin** доступен на [http://localhost:5050](http://localhost:5050)
 
 ### 4. Установка Python-зависимостей
 
 ```bash
 python -m venv .venv
 .venv\Scripts\activate   # Windows
-# source .venv/bin/activate  # Linux/Mac
 pip install -r requirements.txt
 ```
 
 ## Структура проекта
 
 ```
-Проект-Бот/
-├── docker/
-│   └── postgres/
-│       └── init.sql          # SQL-схема БД (создаётся при первом запуске)
+trading-bot/
+├── sql/
+│   └── init.sql              # SQL-схема БД
 ├── src/                       # Исходный код бота
-├── .env                       # Конфигурация (НЕ коммитить!)
 ├── .env.example               # Пример конфигурации
 ├── .gitignore
-├── docker-compose.yml         # PostgreSQL + pgAdmin
 ├── requirements.txt           # Python-зависимости
 └── README.md
 ```

@@ -1,4 +1,4 @@
-﻿# Python
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -10,9 +10,6 @@ env/
 
 # Environment
 .env
-
-# Docker
-docker/postgres/data/
 
 # IDE
 .vscode/
