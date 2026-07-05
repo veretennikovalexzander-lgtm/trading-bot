@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from urllib.parse import quote_plus
 
 from dotenv import load_dotenv
 
@@ -40,7 +40,10 @@ class PostgresConfig:
 
     @property
     def url(self) -> str:
-        return f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.db}"
+        return (
+            f"postgresql://{quote_plus(self.user)}:{quote_plus(self.password)}"
+            f"@{self.host}:{self.port}/{self.db}"
+        )
 
 
 @dataclass
@@ -74,24 +77,29 @@ class BotConfig:
         default_factory=lambda: _env_float("BOT_PROFIT_TARGET", 100.0)
     )
     use_strict_rsi: bool = field(
-        default_factory=lambda: _env_bool("BOT_STRICT_RSI", True)
-    )  # FR-2.8
+        default_factory=lambda: _env_bool("BOT_STRICT_RSI", False)
+    )
 
     def override_from_db(self, db_configs: dict[str, str]):
         """FR-4.7: Override settings from bot_config table at runtime."""
         for key, value in db_configs.items():
-            if key == "risk_per_trade":
-                self.risk_per_trade = float(value)
-            elif key == "max_trades_per_day":
-                self.max_trades_per_day = int(value)
-            elif key == "trade_amount_pct":
-                self.trade_amount_pct = float(value)
-            elif key == "use_strict_rsi":
-                self.use_strict_rsi = value.lower() in ("true", "1")
-            elif key == "strategy":
-                self.strategy = value
-            elif key == "max_positions":
-                self.max_positions = int(value)
+            try:
+                if key == "risk_per_trade":
+                    self.risk_per_trade = float(value)
+                elif key == "max_trades_per_day":
+                    self.max_trades_per_day = int(value)
+                elif key == "trade_amount_pct":
+                    self.trade_amount_pct = float(value)
+                elif key == "use_strict_rsi":
+                    self.use_strict_rsi = value.lower() in ("true", "1")
+                elif key == "strategy":
+                    self.strategy = value
+                elif key == "max_positions":
+                    self.max_positions = int(value)
+            except (ValueError, TypeError):
+                from loguru import logger
+
+                logger.warning(f"Invalid config value for {key}: {value}")
 
 
 @dataclass
@@ -114,19 +122,32 @@ def get_config() -> AppConfig:
 def reload_from_db(session=None):
     """FR-4.7: Reload bot config from database."""
     if session is None:
-        from src.database import get_session
+        try:
+            from src.database import get_session
 
-        session = get_session()
-    from src.models import BotConfig as BotConfigModel
+            session = get_session()
+            should_close = True
+        except Exception:
+            from loguru import logger
+
+            logger.warning("Cannot create session for config reload")
+            return
+    else:
+        should_close = False
 
     try:
+        from src.models import BotConfig as BotConfigModel
+
         rows = session.query(BotConfigModel).all()
         db_configs = {r.config_key: r.config_value for r in rows}
         get_config().bot.override_from_db(db_configs)
         from loguru import logger
 
-        logger.info(f"Config reloaded from DB: {list(db_configs.keys())}")
+        logger.debug(f"Config reloaded from DB: {list(db_configs.keys())}")
     except Exception as e:
         from loguru import logger
 
         logger.warning(f"Could not reload config from DB: {e}")
+    finally:
+        if should_close:
+            session.close()

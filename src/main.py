@@ -1,5 +1,5 @@
 """
-Trading Bot — main controller.
+Trading Bot — main controller (all fixes applied).
 Usage: python -m src.main [start|stop|status|close SYMBOL|logs N]
 """
 
@@ -31,7 +31,9 @@ MAX_PING_FAILURES = 3
 MAX_WS_RECONNECTS = 5
 WS_RECONNECT_WINDOW_MIN = 10
 MAX_CANDLES = 100
+PRICE_CRASH_CANDLES = 60  # 60 x 1m = 1 hour (was 12 for 5m)
 SNAPSHOT_INTERVAL_SEC = 6 * 3600
+CONFIG_RELOAD_SEC = 300
 
 STATUS_FILE = Path(__file__).resolve().parents[1] / "bot_status.json"
 PROFIT_FILE = Path(__file__).resolve().parents[1] / "profit_btc.json"
@@ -60,9 +62,7 @@ class NetworkWatchdog:
                 self.ping_failures = 0
             else:
                 self.ping_failures += 1
-                logger.warning(
-                    f"Ping failed ({self.ping_failures}/{MAX_PING_FAILURES})"
-                )
+                logger.warning(f"Ping fail ({self.ping_failures}/{MAX_PING_FAILURES})")
             if self.ping_failures >= MAX_PING_FAILURES:
                 logger.critical("NETWORK LOST — stopping bot")
                 self.controller.stop()
@@ -91,10 +91,17 @@ class BotController:
         self.total_profit_btc = 0.0
         self.candles: dict[str, deque[dict]] = {}
         self.last_prices: dict[str, float] = {}
+        self.strategies: dict[str, BollingerRSIStrategy] = {}
         self.last_snapshot = datetime.min.replace(tzinfo=timezone.utc)
         self.last_config_reload = datetime.min.replace(tzinfo=timezone.utc)
-        for symbol in get_config().bot.symbols:
+        cfg = get_config()
+        for symbol in cfg.bot.symbols:
             self.candles[symbol] = deque(maxlen=MAX_CANDLES)
+            self.strategies[symbol] = BollingerRSIStrategy(
+                symbol=symbol,
+                interval=INTERVAL,
+                use_strict_filter=cfg.bot.use_strict_rsi,
+            )
         self._load_profit()
 
     # ---- Profit (BTC) ----
@@ -137,6 +144,7 @@ class BotController:
             )
         )
         session.commit()
+        session.close()
 
     # ---- Snapshots ----
     def _take_snapshot(self):
@@ -153,6 +161,7 @@ class BotController:
                 )
             )
             session.commit()
+            session.close()
             self.last_snapshot = datetime.now(timezone.utc)
             logger.info(f"Snapshot: {balance:.2f} USDT")
         except Exception as e:
@@ -192,8 +201,9 @@ class BotController:
                     )
                 )
                 session.commit()
+            session.close()
         except Exception:
-            pass  # Non-critical
+            pass
 
     # ---- Status file ----
     def _write_status_file(self):
@@ -242,11 +252,11 @@ class BotController:
 
     def _load_historical_candles(self):
         client = get_client()
-        for symbol, buf in self.candles.items():
+        for symbol in self.candles:
             try:
                 klines = client.get_klines(symbol=symbol, interval=INTERVAL, limit=50)
                 for k in klines:
-                    buf.append(
+                    self.candles[symbol].append(
                         {
                             "open": float(k[1]),
                             "high": float(k[2]),
@@ -261,7 +271,7 @@ class BotController:
             except Exception as e:
                 logger.error(f"Failed to load candles for {symbol}: {e}")
 
-    # ---- CLI commands ----
+    # ---- CLI ----
     def manual_close(self, symbol: str) -> bool:
         session = get_session()
         pos = (
@@ -270,9 +280,11 @@ class BotController:
             .first()
         )
         if not pos:
+            session.close()
             print(f"No open position for {symbol}")
             return False
         price = get_current_price(symbol)
+        session.close()
         return self.trade_executor.close_position(pos, price, reason="manual")
 
     def show_status(self):
@@ -281,6 +293,7 @@ class BotController:
         positions = (
             session.query(PositionModel).filter(PositionModel.status == "OPEN").all()
         )
+        session.close()
         running = False
         profit_btc = 0.0
         if STATUS_FILE.exists():
@@ -301,18 +314,19 @@ class BotController:
             f"  Loss streak: {daily['consecutive_losses']} | Breaker: {daily['breaker']}"
         )
         if positions:
-            print(f"\n  Open positions ({len(positions)}):")
+            print(f"\n  Positions ({len(positions)}):")
             for p in positions:
                 print(
                     f"    {p.symbol} entry={float(p.entry_price):.2f} qty={float(p.quantity):.6f} SL={float(p.stop_loss or 0):.2f}"
                 )
         else:
-            print("\n  Open positions: 0")
+            print("\n  Positions: 0")
         print(f"{'=' * 45}\n")
 
     def show_logs(self, n: int = 20):
         session = get_session()
         logs = session.query(BotLog).order_by(BotLog.created_at.desc()).limit(n).all()
+        session.close()
         for entry in reversed(logs):
             print(f"[{entry.level}] [{entry.category or '-'}] {entry.message}")
 
@@ -379,26 +393,31 @@ class BotController:
 
         cfg = get_config()
 
-        # Daily drawdown check (FR-3.6)
+        # Daily drawdown (FR-3.6)
         if self.risk_manager.day_start_balance > 0:
-            current_balance = get_account_balance("USDT")
-            self.risk_manager.check_daily_drawdown(current_balance)
+            self.risk_manager.check_daily_drawdown(get_account_balance("USDT"))
 
-        # Config reload from DB every 5 minutes (FR-4.7)
-        if (datetime.now(timezone.utc) - self.last_config_reload).total_seconds() > 300:
+        # Config reload from DB (FR-4.7)
+        if (
+            datetime.now(timezone.utc) - self.last_config_reload
+        ).total_seconds() > CONFIG_RELOAD_SEC:
             reload_from_db()
             self.last_config_reload = datetime.now(timezone.utc)
 
-        # Circuit Breaker
+        # Circuit Breaker: ATR
         if len(buf) >= 15:
             df_atr = pd.DataFrame(list(buf))
             atr_val = (df_atr["high"] - df_atr["low"]).tail(14).mean()
             atr_pct = (atr_val / candle["close"]) * 100
             if atr_pct > 3.0:
                 self.risk_manager.check_atr_volatility(atr_pct)
-        if len(buf) >= 12:
-            price_1h_ago = list(buf)[-12]["close"]
-            self.risk_manager.check_price_crash(symbol, candle["close"], price_1h_ago)
+
+        # Circuit Breaker: Price crash (60 candles for 1m = 1 hour)
+        if len(buf) >= PRICE_CRASH_CANDLES:
+            price_n_candles_ago = list(buf)[-PRICE_CRASH_CANDLES]["close"]
+            self.risk_manager.check_price_crash(
+                symbol, candle["close"], price_n_candles_ago
+            )
 
         if not self.risk_manager.is_trading_allowed()[0]:
             return
@@ -420,6 +439,7 @@ class BotController:
 
             if pos.take_profit and close_price >= float(pos.take_profit):
                 realized_pnl = float(pos.unrealized_pnl)
+                session.close()
                 self.trade_executor.close_position(
                     pos, close_price, reason="take_profit"
                 )
@@ -431,6 +451,7 @@ class BotController:
                 return
             if pos.stop_loss and close_price <= float(pos.stop_loss):
                 realized_pnl = float(pos.unrealized_pnl)
+                session.close()
                 self.trade_executor.close_position(pos, close_price, reason="stop_loss")
                 self.risk_manager.record_trade(realized_pnl)
                 self.total_trades += 1
@@ -438,14 +459,12 @@ class BotController:
                 if realized_pnl > 0:
                     self._fix_profit_to_btc(realized_pnl)
                 return
+            session.close()
         else:
-            # Check entry signal
+            session.close()
+            # Use pre-created strategy (not re-creating every candle)
+            strategy = self.strategies[symbol]
             df = pd.DataFrame(list(buf))
-            strategy = BollingerRSIStrategy(
-                symbol=symbol,
-                interval=INTERVAL,
-                use_strict_filter=cfg.bot.use_strict_rsi,
-            )
             signal = strategy.analyze(df)
             if signal.signal.value == "BUY":
                 logger.info(
