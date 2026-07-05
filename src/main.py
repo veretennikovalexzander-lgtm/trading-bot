@@ -233,6 +233,7 @@ class BCtrl:
         for sym in self.candles:
             try:
                 kls = cl.get_klines(symbol=sym, interval=INTERVAL, limit=50)
+            logger.info(f"Poll {sym}: got {len(kls)} klines, last_ct={self._last_close_times.get(sym,0)} newest_ct={kls[-1][6] if kls else 0}")
                 for k in kls:
                     self.candles[sym].append(
                         {
@@ -256,6 +257,7 @@ class BCtrl:
             try:
                 for sym in self.candles:
                     kls = cl.get_klines(symbol=sym, interval=INTERVAL, limit=3)
+            logger.info(f"Poll {sym}: got {len(kls)} klines, last_ct={self._last_close_times.get(sym,0)} newest_ct={kls[-1][6] if kls else 0}")
                     for k in kls:
                         ct = k[6]
                         if ct <= self._last_close_times.get(sym, 0):
