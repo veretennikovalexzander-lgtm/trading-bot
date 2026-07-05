@@ -100,7 +100,7 @@ class BotController:
             self.strategies[symbol] = BollingerRSIStrategy(
                 symbol=symbol,
                 interval=INTERVAL,
-                use_strict_filter=cfg.bot.use_strict_rsi,
+                use_strict_filter=cfg.bot.use_strict_rsi, debug=True,
             )
         self._load_profit()
 
