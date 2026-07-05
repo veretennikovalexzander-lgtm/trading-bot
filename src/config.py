@@ -1,6 +1,7 @@
 """
-Configuration loader: .env + bot_config from database.
+Configuration loader: .env + bot_config from database (FR-4.7).
 """
+
 from __future__ import annotations
 
 import os
@@ -10,7 +11,6 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-# Load .env from project root
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 
@@ -27,8 +27,7 @@ def _env_float(key: str, default: float = 0.0) -> float:
 
 
 def _env_bool(key: str, default: bool = False) -> bool:
-    val = os.getenv(key, "").lower()
-    return val in ("true", "1", "yes")
+    return os.getenv(key, "").lower() in ("true", "1", "yes")
 
 
 @dataclass
@@ -55,20 +54,44 @@ class BinanceConfig:
 class BotConfig:
     strategy: str = field(default_factory=lambda: _env("BOT_STRATEGY", "bollinger_rsi"))
     symbols: list[str] = field(
-        default_factory=lambda: [s.strip() for s in _env("BOT_SYMBOLS", "BTCUSDT,ETHUSDT").split(",") if s.strip()]
-    )
-    trade_amount_pct: float = field(default_factory=lambda: _env_float("BOT_TRADE_AMOUNT_PCT", 10.0))  # % of balance
-    max_positions: int = field(default_factory=lambda: _env_int("BOT_MAX_POSITIONS", 5))
-    risk_per_trade: float = field(default_factory=lambda: _env_float("BOT_RISK_PER_TRADE", 1.0))  # %
-    max_trades_per_day: int = field(default_factory=lambda: _env_int("BOT_MAX_TRADES_PER_DAY", 30))
-    profit_target: float = field(default_factory=lambda: _env_float("BOT_PROFIT_TARGET", 100.0))  # USDT base
-    telegram_enabled: bool = field(default_factory=lambda: _env_bool("TELEGRAM_ENABLED", False))
-    telegram_token: str = field(default_factory=lambda: _env("TELEGRAM_TOKEN", ""))
-    telegram_chat_ids: list[int] = field(
         default_factory=lambda: [
-            int(x.strip()) for x in _env("TELEGRAM_CHAT_IDS", "").split(",") if x.strip()
+            s.strip()
+            for s in _env("BOT_SYMBOLS", "BTCUSDT,ETHUSDT").split(",")
+            if s.strip()
         ]
     )
+    trade_amount_pct: float = field(
+        default_factory=lambda: _env_float("BOT_TRADE_AMOUNT_PCT", 10.0)
+    )
+    max_positions: int = field(default_factory=lambda: _env_int("BOT_MAX_POSITIONS", 5))
+    risk_per_trade: float = field(
+        default_factory=lambda: _env_float("BOT_RISK_PER_TRADE", 1.0)
+    )
+    max_trades_per_day: int = field(
+        default_factory=lambda: _env_int("BOT_MAX_TRADES_PER_DAY", 30)
+    )
+    profit_target: float = field(
+        default_factory=lambda: _env_float("BOT_PROFIT_TARGET", 100.0)
+    )
+    use_strict_rsi: bool = field(
+        default_factory=lambda: _env_bool("BOT_STRICT_RSI", True)
+    )  # FR-2.8
+
+    def override_from_db(self, db_configs: dict[str, str]):
+        """FR-4.7: Override settings from bot_config table at runtime."""
+        for key, value in db_configs.items():
+            if key == "risk_per_trade":
+                self.risk_per_trade = float(value)
+            elif key == "max_trades_per_day":
+                self.max_trades_per_day = int(value)
+            elif key == "trade_amount_pct":
+                self.trade_amount_pct = float(value)
+            elif key == "use_strict_rsi":
+                self.use_strict_rsi = value.lower() in ("true", "1")
+            elif key == "strategy":
+                self.strategy = value
+            elif key == "max_positions":
+                self.max_positions = int(value)
 
 
 @dataclass
@@ -78,7 +101,6 @@ class AppConfig:
     bot: BotConfig = field(default_factory=BotConfig)
 
 
-# Singleton
 _config: AppConfig | None = None
 
 
@@ -87,3 +109,24 @@ def get_config() -> AppConfig:
     if _config is None:
         _config = AppConfig()
     return _config
+
+
+def reload_from_db(session=None):
+    """FR-4.7: Reload bot config from database."""
+    if session is None:
+        from src.database import get_session
+
+        session = get_session()
+    from src.models import BotConfig as BotConfigModel
+
+    try:
+        rows = session.query(BotConfigModel).all()
+        db_configs = {r.config_key: r.config_value for r in rows}
+        get_config().bot.override_from_db(db_configs)
+        from loguru import logger
+
+        logger.info(f"Config reloaded from DB: {list(db_configs.keys())}")
+    except Exception as e:
+        from loguru import logger
+
+        logger.warning(f"Could not reload config from DB: {e}")
