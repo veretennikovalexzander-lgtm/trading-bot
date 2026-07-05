@@ -111,7 +111,7 @@ class BotController:
                 self.total_profit_btc = json.loads(PROFIT_FILE.read_text()).get(
                     "total_btc", 0.0
                 )
-            except Exception:
+            except Exception as e:
                 pass
 
     def _save_profit(self):
@@ -202,7 +202,7 @@ class BotController:
                 )
                 session.commit()
             session.close()
-        except Exception:
+        except Exception as e:
             pass
 
     # ---- Status file ----
@@ -243,7 +243,7 @@ class BotController:
         if self.websocket_manager:
             try:
                 self.websocket_manager.stop()
-            except Exception:
+            except Exception as e:
                 pass
             self.websocket_manager = None
         self._take_snapshot()
@@ -301,7 +301,7 @@ class BotController:
                 data = json.loads(STATUS_FILE.read_text())
                 running = data.get("running", False)
                 profit_btc = data.get("profit_btc", 0.0)
-            except Exception:
+            except Exception as e:
                 pass
         balance = get_account_balance("USDT")
         print(f"\n{'=' * 45}")
