@@ -16,7 +16,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import JSON as pgJSON
 
 from src.database import Base
 
@@ -139,7 +139,7 @@ class BotLog(Base):
     level = Column(String(10), nullable=False, default="INFO")
     category = Column(String(50))
     message = Column(Text, nullable=False)
-    metadata_ = Column("metadata", JSONB)
+    metadata_ = Column("metadata", pgJSON)
     created_at = Column(DateTime(timezone=True), default=_utcnow, index=True)
 
 
@@ -150,5 +150,5 @@ class AccountSnapshot(Base):
     total_balance = Column(Numeric(18, 8), nullable=False)
     available_balance = Column(Numeric(18, 8), nullable=False)
     locked_balance = Column(Numeric(18, 8), default=0)
-    balances_json = Column(JSONB)
+    balances_json = Column(pgJSON)
     snapshot_time = Column(DateTime(timezone=True), default=_utcnow)
