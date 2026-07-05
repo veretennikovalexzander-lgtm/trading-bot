@@ -1,9 +1,7 @@
 """
-Paper Trading: simulate trades without real orders (FR-6.2).
+Paper Trading: simulate trades using real Binance klines (FR-6.2).
 
-Usage:
-    python -m src.paper_trader start    # Run paper trading
-    python -m src.paper_trader status   # Show paper account status
+Usage: python -m src.paper_trader [start|status]
 """
 
 from __future__ import annotations
@@ -15,6 +13,7 @@ from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pandas as pd
 from loguru import logger
 from src.binance_client import get_client, get_current_price
 from src.config import get_config
@@ -23,12 +22,14 @@ from src.strategy.bollinger_rsi import BollingerRSIStrategy
 
 PAPER_FILE = Path(__file__).resolve().parents[1] / "paper_account.json"
 MAX_CANDLES = 100
+INTERVAL = "1m"
+CHECK_EVERY_SEC = 15
 
 
 class PaperTrader:
     def __init__(self):
-        self.balance = 100.0  # Start with 100 USDT
-        self.positions: dict[str, dict] = {}  # symbol → {entry, qty, sl, tp}
+        self.balance = 100.0
+        self.positions: dict[str, dict] = {}
         self.trade_log: list[dict] = []
         self._candles: dict[str, deque[dict]] = {}
         self.strategies: dict[str, BollingerRSIStrategy] = {}
@@ -36,10 +37,13 @@ class PaperTrader:
         cfg = get_config()
         for symbol in cfg.bot.symbols:
             self.strategies[symbol] = BollingerRSIStrategy(
-                symbol=symbol, use_strict_filter=cfg.bot.use_strict_rsi
+                symbol=symbol,
+                interval=INTERVAL,
+                use_strict_filter=cfg.bot.use_strict_rsi,
             )
             self._candles[symbol] = deque(maxlen=MAX_CANDLES)
         self._load_state()
+        self._load_historical()
 
     def _save_state(self):
         PAPER_FILE.write_text(
@@ -56,48 +60,20 @@ class PaperTrader:
     def _load_state(self):
         if PAPER_FILE.exists():
             try:
-                data = json.loads(PAPER_FILE.read_text())
-                self.balance = data.get("balance", 100.0)
-                self.positions = data.get("positions", {})
-                self.trade_log = data.get("trade_log", [])
-                logger.info(f"Paper account loaded: {self.balance:.2f} USDT")
+                d = json.loads(PAPER_FILE.read_text())
+                self.balance = d.get("balance", 100.0)
+                self.positions = d.get("positions", {})
+                self.trade_log = d.get("trade_log", [])
+                logger.info(f"Paper account: {self.balance:.2f} USDT")
             except Exception:
                 pass
 
-    def show_status(self):
-        print(f"\n{'=' * 40}")
-        print(" Paper Trading Status")
-        print(f"{'=' * 40}")
-        print(f" Balance: {self.balance:.2f} USDT")
-        total_pnl = sum(t.get("pnl", 0) for t in self.trade_log)
-        print(f" Total PnL: {total_pnl:.2f} USDT")
-        print(f" Total trades: {len(self.trade_log)}")
-        if self.positions:
-            print(f"\n Positions ({len(self.positions)}):")
-            for sym, pos in self.positions.items():
-                price = get_current_price(sym)
-                pnl = (price - pos["entry"]) * pos["qty"]
-                print(
-                    f"  {sym} entry={pos['entry']:.2f} qty={pos['qty']:.6f} PnL={pnl:.2f}"
-                )
-        else:
-            print("\n Positions: 0")
-        if self.trade_log:
-            print(f"\n Last 5 trades:")
-            for t in self.trade_log[-5:]:
-                print(
-                    f"  {t['symbol']} {t['side']} @ {t['price']:.2f} PnL={t['pnl']:.2f}"
-                )
-        print(f"{'=' * 40}\n")
-
-    def run(self):
-        logger.info("=== Paper Trading STARTED ===")
+    def _load_historical(self):
+        """Load real klines from Binance REST."""
         client = get_client()
-
-        # Load historical candles
         for symbol in self._candles:
             try:
-                klines = client.get_klines(symbol=symbol, interval="5m", limit=50)
+                klines = client.get_klines(symbol=symbol, interval=INTERVAL, limit=50)
                 for k in klines:
                     self._candles[symbol].append(
                         {
@@ -110,41 +86,62 @@ class PaperTrader:
                     )
                 logger.info(f"Paper: loaded {len(klines)} candles for {symbol}")
             except Exception as e:
-                logger.error(f"Paper: failed to load candles for {symbol}: {e}")
+                logger.error(f"Paper: failed to load {symbol}: {e}")
 
-        import pandas as pd
+    def show_status(self):
+        pnl_total = sum(t.get("pnl", 0) for t in self.trade_log)
+        print(f"\n{'=' * 45}")
+        print("  Paper Trading Status")
+        print(f"{'=' * 45}")
+        print(f"  Balance: {self.balance:.2f} USDT")
+        print(f"  Total PnL: {pnl_total:.2f} USDT | Trades: {len(self.trade_log)}")
+        if self.positions:
+            print(f"\n  Positions ({len(self.positions)}):")
+            for sym, pos in self.positions.items():
+                cur = get_current_price(sym)
+                pnl = (cur - pos["entry"]) * pos["qty"]
+                print(
+                    f"    {sym} entry={pos['entry']:.2f} qty={pos['qty']:.6f} PnL={pnl:.2f}"
+                )
+        else:
+            print("\n  Positions: 0")
+        if self.trade_log:
+            print(f"\n  Last 5 trades:")
+            for t in self.trade_log[-5:]:
+                print(
+                    f"    {t['symbol']} {t['side']} @ {t['price']:.2f} PnL={t['pnl']:.2f}"
+                )
+        buf_sizes = " | ".join(f"{s}={len(self._candles[s])}" for s in self._candles)
+        print(f"\n  Buffers: {buf_sizes}")
+        print(f"{'=' * 45}\n")
 
+    def run(self):
+        logger.info("=== Paper Trading STARTED ===")
         while True:
+            # Update latest candle with current price
+            for symbol in self._candles:
+                price = get_current_price(symbol)
+                if price <= 0:
+                    continue
+                buf = self._candles[symbol]
+                if buf:
+                    last = buf[-1]
+                    last["high"] = max(last["high"], price)
+                    last["low"] = min(last["low"], price)
+                    last["close"] = price
+
+            # Check signals
             for symbol, buf in self._candles.items():
-                # Get latest price and add to buffer
+                if len(buf) < 25:
+                    continue
+                if not self.risk_manager.is_trading_allowed()[0]:
+                    continue
+
                 price = get_current_price(symbol)
                 if price <= 0:
                     continue
 
-                last_candle = buf[-1] if buf else None
-                if last_candle:
-                    last_candle["close"] = price
-                    last_candle["high"] = max(last_candle["high"], price)
-                    last_candle["low"] = min(last_candle["low"], price)
-                else:
-                    buf.append(
-                        {
-                            "open": price,
-                            "high": price,
-                            "low": price,
-                            "close": price,
-                            "volume": 0,
-                        }
-                    )
-
-                if len(buf) < 25:
-                    continue
-
-                allowed, _ = self.risk_manager.is_trading_allowed()
-                if not allowed:
-                    continue
-
-                # Check position TP/SL
+                # Position TP/SL
                 if symbol in self.positions:
                     pos = self.positions[symbol]
                     if price >= pos["tp"]:
@@ -158,7 +155,9 @@ class PaperTrader:
                                 "pnl": pnl,
                             }
                         )
-                        logger.info(f"Paper TP {symbol}: +{pnl:.2f} USDT")
+                        logger.info(
+                            f"Paper TP {symbol}: +{pnl:.2f} USDT (balance: {self.balance:.2f})"
+                        )
                         del self.positions[symbol]
                         self.risk_manager.record_trade(pnl)
                         self._save_state()
@@ -173,13 +172,15 @@ class PaperTrader:
                                 "pnl": pnl,
                             }
                         )
-                        logger.info(f"Paper SL {symbol}: {pnl:.2f} USDT")
+                        logger.info(
+                            f"Paper SL {symbol}: {pnl:.2f} USDT (balance: {self.balance:.2f})"
+                        )
                         del self.positions[symbol]
                         self.risk_manager.record_trade(pnl)
                         self._save_state()
                     continue
 
-                # Check entry signal
+                # Entry signal
                 df = pd.DataFrame(list(buf))
                 signal = self.strategies[symbol].analyze(df)
                 if signal.signal.value == "BUY":
@@ -208,17 +209,15 @@ class PaperTrader:
                         )
                         self._save_state()
 
-            time.sleep(10)  # Check every 10 seconds
+            time.sleep(CHECK_EVERY_SEC)
 
 
 def main():
     from src.logger import setup_logging
 
     setup_logging()
-
     cmd = sys.argv[1].lower() if len(sys.argv) >= 2 else ""
     trader = PaperTrader()
-
     if cmd == "start":
         trader.run()
     elif cmd == "status":
