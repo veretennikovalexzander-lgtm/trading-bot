@@ -80,7 +80,7 @@ class BCtrl:
         self.risk = RiskManager()
         self.exec = TradeExecutor()
         self.wd = Nwd(self)
-        self._ws = None
+        self._twm = None
         self._start = None
         self._trades = 0
         self._pbtc = 0.0
@@ -179,7 +179,7 @@ class BCtrl:
         except:
             pass
 
-    def _ws(self):
+    def _wstatus(self):
         STATUS_FILE.write_text(
             json.dumps(
                 {
@@ -205,7 +205,7 @@ class BCtrl:
         self._start = datetime.now(timezone.utc)
         self._lprofit()
         self.wd.start()
-        self._ws()
+        self._wstatus()
         self.risk.day_start_balance = get_account_balance("USDT")
         logger.info("=== Trading Bot STARTED ===")
         self._lcandles()
@@ -217,14 +217,14 @@ class BCtrl:
             return
         self.run = False
         self.wd.stop()
-        if self._ws:
+        if self._twm:
             try:
-                self._ws.stop()
+                self._twm.stop()
             except:
                 pass
-            self._ws = None
+            self._twm = None
         self._snap()
-        self._ws()
+        self._wstatus()
         logger.info("=== STOPPED ===")
 
     def _lcandles(self):
@@ -303,18 +303,18 @@ class BCtrl:
         try:
             from binance import ThreadedWebsocketManager
 
-            self._ws = ThreadedWebsocketManager(
+            self._twm = ThreadedWebsocketManager(
                 api_key=cfg.binance.api_key,
                 api_secret=cfg.binance.api_secret,
                 testnet=True,
             )
-            self._ws.start()
-            self._ws.start_multiplex_socket(
+            self._twm.start()
+            self._twm.start_multiplex_socket(
                 callback=self._k,
                 streams=[f"{s.lower()}@kline_{INTERVAL}" for s in cfg.bot.symbols],
             )
             logger.info(f"WebSocket {INTERVAL}: {cfg.bot.symbols}")
-            self._ws.join()
+            self._twm.join()
         except Exception as e:
             logger.error(f"WebSocket: {e}")
             self.wd.rec()
@@ -407,7 +407,7 @@ class BCtrl:
                     sym, signal.price, signal.stop_loss, signal.take_profit
                 ):
                     self._trades += 1
-        self._ws()
+        self._wstatus()
         if (datetime.now(timezone.utc) - self._lsnap).total_seconds() > SNAP_S:
             self._snap()
 
