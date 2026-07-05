@@ -353,7 +353,7 @@ class BotController:
             self.watchdog.record_ws_disconnect()
 
     def _on_kline(self, msg: dict):
-        logger.info(f"WS raw: {symbol}")
+        logger.info(f"WS msg received")
         if not self.running:
             return
         data = msg.get("data", {})
