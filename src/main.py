@@ -35,7 +35,8 @@ SNAP_S = 6 * 3600
 CFG_RELOAD_S = 300
 
 STATUS_FILE = Path(__file__).resolve().parents[1] / "bot_status.json"
-PROFIT_FILE = Path(__file__).resolve().parents[1] / "profit_btc.json"
+PROFIT_BTC_FILE = Path(__file__).resolve().parents[1] / "profit_btc.json"
+PROFIT_USDT_FILE = Path(__file__).resolve().parents[1] / "profit_usdt.json"
 
 
 class Nwd:
@@ -77,6 +78,7 @@ class BCtrl:
         self.started_at = None
         self.trades = 0
         self.pbtc = 0.0
+        self.pusdt = 0.0
         self.candles: dict[str, deque[dict]] = {}
         self.strategies: dict[str, BollingerRSIStrategy] = {}
         self.last_snap = datetime.min.replace(tzinfo=timezone.utc)
@@ -94,14 +96,14 @@ class BCtrl:
         self._load_profit()
 
     def _load_profit(self):
-        if PROFIT_FILE.exists():
+        if PROFIT_BTC_FILE.exists():
             try:
-                self.pbtc = json.loads(PROFIT_FILE.read_text()).get("total_btc", 0.0)
+                self.pbtc = json.loads(PROFIT_BTC_FILE.read_text()).get("total_btc", 0.0)
             except:
                 pass
 
     def _save_profit(self):
-        PROFIT_FILE.write_text(
+        PROFIT_BTC_FILE.write_text(
             json.dumps(
                 {
                     "total_btc": round(self.pbtc, 8),
@@ -111,7 +113,7 @@ class BCtrl:
             )
         )
 
-    def _fix_profit(self, p):
+    def _fix_profit(self, p, symbol=""):
         bp = get_current_price("BTCUSDT")
         if bp <= 0:
             return
@@ -140,7 +142,7 @@ class BCtrl:
                     available_balance=bal,
                     locked_balance=0,
                     snapshot_time=datetime.now(timezone.utc),
-                    balances_json={"profit_btc": self.pbtc},
+                    balances_json={"profit_btc": self.pbtc, "profit_usdt": self.pusdt},
                 )
             )
             s.commit()
@@ -194,7 +196,7 @@ class BCtrl:
                     else None,
                     "network_ok": ping(),
                     "trades": self.trades,
-                    "profit_btc": round(self.pbtc, 8),
+                    "profit_btc": round(self.pbtc, 8), "profit_usdt": round(self.pusdt, 4),
                     **(self.risk.get_daily_stats()),
                 },
                 indent=2,
@@ -335,7 +337,7 @@ class BCtrl:
                 self.trades += 1
                 logger.info(f"TP {sym} @ {price:.2f} PnL={pnl:.2f}")
                 if pnl > 0:
-                    self._fix_profit(pnl)
+                    self._fix_profit(pnl, symbol)
                     return
             if pos.stop_loss and price <= float(pos.stop_loss):
                 pnl = float(pos.unrealized_pnl)
@@ -345,7 +347,7 @@ class BCtrl:
                 self.trades += 1
                 logger.info(f"SL {sym} @ {price:.2f} PnL={pnl:.2f}")
                 if pnl > 0:
-                    self._fix_profit(pnl)
+                    self._fix_profit(pnl, symbol)
                     return
             s.close()
         else:
@@ -386,12 +388,13 @@ class BCtrl:
                 j = json.loads(STATUS_FILE.read_text())
                 run = j.get("running", False)
                 pbtc = j.get("profit_btc", 0.0)
+                pusdt = j.get("profit_usdt", 0.0)
             except:
                 pass
         bal = get_account_balance("USDT")
         print(f"\n{'=' * 45}\n  Bot Status ({INTERVAL})\n{'=' * 45}")
         print(f"  Running: {run} | Network: {'OK' if ping() else 'FAIL'}")
-        print(f"  Balance: {bal:.2f} USDT | Profit: {pbtc:.8f} BTC")
+        print(f"  Balance: {bal:.2f} USDT | BTC: {pbtc:.8f} | USDT: {pusdt:.2f}")
         print(f"  Trades: {d['trades']} | PnL: {d['pnl']} USDT")
         print(f"  Loss streak: {d['consecutive_losses']} | Breaker: {d['breaker']}")
         if pos:
