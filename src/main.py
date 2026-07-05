@@ -1,5 +1,5 @@
 """
-Trading Bot — main controller (all fixes applied).
+Trading Bot — REST polling mode (reliable kline fetching).
 Usage: python -m src.main [start|stop|status|close SYMBOL|logs N]
 """
 
@@ -20,243 +20,219 @@ from src.config import get_config, reload_from_db
 from src.database import get_session, init_db
 from src.logger import setup_logging
 from src.models import AccountSnapshot, BotLog, MarketData
-from src.models import Position as PositionModel
+from src.models import Position as PM
 from src.risk_manager import RiskManager
 from src.strategy.bollinger_rsi import BollingerRSIStrategy
 from src.trade_executor import TradeExecutor
 
 INTERVAL = "1m"
-PING_INTERVAL_SEC = 30
-MAX_PING_FAILURES = 3
-MAX_WS_RECONNECTS = 5
-WS_RECONNECT_WINDOW_MIN = 10
+POLL_SEC = 15
+PING_S = 30
+MAX_PF = 3
 MAX_CANDLES = 100
-PRICE_CRASH_CANDLES = 60  # 60 x 1m = 1 hour (was 12 for 5m)
-SNAPSHOT_INTERVAL_SEC = 6 * 3600
-CONFIG_RELOAD_SEC = 300
+PRICE_CRASH_CANDLES = 60
+SNAP_S = 6 * 3600
+CFG_RELOAD_S = 300
 
 STATUS_FILE = Path(__file__).resolve().parents[1] / "bot_status.json"
 PROFIT_FILE = Path(__file__).resolve().parents[1] / "profit_btc.json"
 
 
-class NetworkWatchdog:
-    def __init__(self, controller):
-        self.controller = controller
-        self._stop = threading.Event()
-        self.ping_failures = 0
-        self.ws_disconnects: list[datetime] = []
+class Nwd:
+    def __init__(self, c):
+        self.c = c
+        self.e = threading.Event()
+        self.pf = 0
+        self.dc = []
 
     def start(self):
-        self._stop.clear()
-        threading.Thread(target=self._run, daemon=True).start()
+        self.e.clear()
+        threading.Thread(target=self._r, daemon=True).start()
 
     def stop(self):
-        self._stop.set()
+        self.e.set()
 
-    def _run(self):
-        while not self._stop.is_set():
-            self._stop.wait(PING_INTERVAL_SEC)
-            if self._stop.is_set():
+    def _r(self):
+        while not self.e.is_set():
+            self.e.wait(PING_S)
+            if self.e.is_set():
                 break
             if ping():
-                self.ping_failures = 0
+                self.pf = 0
             else:
-                self.ping_failures += 1
-                logger.warning(f"Ping fail ({self.ping_failures}/{MAX_PING_FAILURES})")
-            if self.ping_failures >= MAX_PING_FAILURES:
-                logger.critical("NETWORK LOST — stopping bot")
-                self.controller.stop()
+                self.pf += 1
+                logger.warning(f"Ping fail {self.pf}/{MAX_PF}")
+            if self.pf >= MAX_PF:
+                logger.critical("NET LOST")
+                self.c.stop()
                 return
-            cutoff = datetime.now(timezone.utc) - timedelta(
-                minutes=WS_RECONNECT_WINDOW_MIN
-            )
-            self.ws_disconnects = [t for t in self.ws_disconnects if t > cutoff]
-
-    def record_ws_disconnect(self):
-        self.ws_disconnects.append(datetime.now(timezone.utc))
-        if len(self.ws_disconnects) >= MAX_WS_RECONNECTS:
-            logger.critical("NETWORK UNSTABLE — stopping bot")
-            self.controller.stop()
 
 
-class BotController:
+class BCtrl:
     def __init__(self):
         self.running = False
-        self.risk_manager = RiskManager()
-        self.trade_executor = TradeExecutor()
-        self.watchdog = NetworkWatchdog(self)
-        self.websocket_manager = None
-        self.started_at: datetime | None = None
-        self.total_trades = 0
-        self.total_profit_btc = 0.0
+        self.risk = RiskManager()
+        self.exec = TradeExecutor()
+        self.wd = Nwd(self)
+        self.started_at = None
+        self.trades = 0
+        self.pbtc = 0.0
         self.candles: dict[str, deque[dict]] = {}
-        self.last_prices: dict[str, float] = {}
         self.strategies: dict[str, BollingerRSIStrategy] = {}
-        self.last_snapshot = datetime.min.replace(tzinfo=timezone.utc)
-        self.last_config_reload = datetime.min.replace(tzinfo=timezone.utc)
+        self.last_snap = datetime.min.replace(tzinfo=timezone.utc)
+        self.last_cfg = datetime.min.replace(tzinfo=timezone.utc)
+        self._last_close_times: dict[str, int] = {}
         cfg = get_config()
-        for symbol in cfg.bot.symbols:
-            self.candles[symbol] = deque(maxlen=MAX_CANDLES)
-            self.strategies[symbol] = BollingerRSIStrategy(
-                symbol=symbol,
+        for s in cfg.bot.symbols:
+            self.candles[s] = deque(maxlen=MAX_CANDLES)
+            self.strategies[s] = BollingerRSIStrategy(
+                symbol=s,
                 interval=INTERVAL,
-                use_strict_filter=cfg.bot.use_strict_rsi, debug=True,
+                use_strict_filter=cfg.bot.use_strict_rsi,
+                debug=True,
             )
         self._load_profit()
 
-    # ---- Profit (BTC) ----
     def _load_profit(self):
         if PROFIT_FILE.exists():
             try:
-                self.total_profit_btc = json.loads(PROFIT_FILE.read_text()).get(
-                    "total_btc", 0.0
-                )
-            except Exception as e:
+                self.pbtc = json.loads(PROFIT_FILE.read_text()).get("total_btc", 0.0)
+            except:
                 pass
 
     def _save_profit(self):
         PROFIT_FILE.write_text(
             json.dumps(
                 {
-                    "total_btc": round(self.total_profit_btc, 8),
+                    "total_btc": round(self.pbtc, 8),
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 },
                 indent=2,
             )
         )
 
-    def _fix_profit_to_btc(self, profit_usdt: float):
-        btc_price = get_current_price("BTCUSDT")
-        if btc_price <= 0:
+    def _fix_profit(self, p):
+        bp = get_current_price("BTCUSDT")
+        if bp <= 0:
             return
-        btc_amount = profit_usdt / btc_price
-        self.total_profit_btc += btc_amount
+        btc = p / bp
+        self.pbtc += btc
         self._save_profit()
-        logger.info(
-            f"PROFIT: {profit_usdt:.2f} USDT → {btc_amount:.8f} BTC (total: {self.total_profit_btc:.8f} BTC)"
-        )
-        session = get_session()
-        session.add(
+        logger.info(f"PROFIT: {p:.2f} USDT -> {btc:.8f} BTC (total: {self.pbtc:.8f})")
+        s = get_session()
+        s.add(
             BotLog(
                 level="INFO",
                 category="profit",
-                message=f"+{profit_usdt:.2f} USDT → {btc_amount:.8f} BTC | Total: {self.total_profit_btc:.8f} BTC",
+                message=f"+{p:.2f} USDT -> {btc:.8f} BTC | Total: {self.pbtc:.8f} BTC",
             )
         )
-        session.commit()
-        session.close()
+        s.commit()
+        s.close()
 
-    # ---- Snapshots ----
-    def _take_snapshot(self):
+    def _snap(self):
         try:
-            balance = get_account_balance("USDT")
-            session = get_session()
-            session.add(
+            bal = get_account_balance("USDT")
+            s = get_session()
+            s.add(
                 AccountSnapshot(
-                    total_balance=balance,
-                    available_balance=balance,
+                    total_balance=bal,
+                    available_balance=bal,
                     locked_balance=0,
                     snapshot_time=datetime.now(timezone.utc),
-                    balances_json={"profit_btc": self.total_profit_btc},
+                    balances_json={"profit_btc": self.pbtc},
                 )
             )
-            session.commit()
-            session.close()
-            self.last_snapshot = datetime.now(timezone.utc)
-            logger.info(f"Snapshot: {balance:.2f} USDT")
+            s.commit()
+            s.close()
+            self.last_snap = datetime.now(timezone.utc)
+            logger.info(f"Snapshot: {bal:.2f} USDT")
         except Exception as e:
-            logger.error(f"Snapshot failed: {e}")
+            logger.error(f"Snapshot: {e}")
 
-    # ---- Candles to DB ----
-    def _save_candle_to_db(self, symbol: str, kline: dict, candle: dict):
+    def _save_candle_db(self, sym, k, c):
         try:
-            session = get_session()
-            open_time = datetime.fromtimestamp(
-                kline.get("t", 0) / 1000, tz=timezone.utc
-            )
-            exists = (
-                session.query(MarketData)
+            s = get_session()
+            ot = datetime.fromtimestamp(k["t"] / 1000, tz=timezone.utc)
+            if (
+                not s.query(MarketData)
                 .filter(
-                    MarketData.symbol == symbol,
+                    MarketData.symbol == sym,
                     MarketData.interval == INTERVAL,
-                    MarketData.open_time == open_time,
+                    MarketData.open_time == ot,
                 )
                 .first()
-            )
-            if not exists:
-                session.add(
+            ):
+                s.add(
                     MarketData(
-                        symbol=symbol,
+                        symbol=sym,
                         interval=INTERVAL,
-                        open_time=open_time,
+                        open_time=ot,
                         close_time=datetime.fromtimestamp(
-                            kline.get("T", 0) / 1000, tz=timezone.utc
+                            k["T"] / 1000, tz=timezone.utc
                         ),
-                        open=candle["open"],
-                        high=candle["high"],
-                        low=candle["low"],
-                        close=candle["close"],
-                        volume=candle["volume"],
-                        trades_count=kline.get("n", 0),
+                        open=c["open"],
+                        high=c["high"],
+                        low=c["low"],
+                        close=c["close"],
+                        volume=c["volume"],
+                        trades_count=k.get("n", 0),
                     )
                 )
-                session.commit()
-            session.close()
+                s.commit()
+            s.close()
         except Exception as e:
-            pass
+            logger.error(f"Save candle {sym}: {e}")
 
-    # ---- Status file ----
-    def _write_status_file(self):
-        data = {
-            "running": self.running,
-            "started_at": self.started_at.isoformat() if self.started_at else None,
-            "network_ok": ping(),
-            "ws_disconnects_10m": len(self.watchdog.ws_disconnects),
-            "total_trades": self.total_trades,
-            "profit_btc": round(self.total_profit_btc, 8),
-            **(self.risk_manager.get_daily_stats()),
-        }
-        STATUS_FILE.write_text(json.dumps(data, indent=2))
+    def _wstatus(self):
+        STATUS_FILE.write_text(
+            json.dumps(
+                {
+                    "running": self.running,
+                    "started_at": self.started_at.isoformat()
+                    if self.started_at
+                    else None,
+                    "network_ok": ping(),
+                    "trades": self.trades,
+                    "profit_btc": round(self.pbtc, 8),
+                    **(self.risk.get_daily_stats()),
+                },
+                indent=2,
+            )
+        )
 
-    # ---- Lifecycle ----
     def start(self):
         if self.running:
             return
         if not ping():
-            print("ERROR: Cannot connect to Binance")
+            print("ERROR: Binance unreachable")
             return
         self.running = True
         self.started_at = datetime.now(timezone.utc)
-        self.watchdog.start()
-        self.risk_manager.day_start_balance = get_account_balance("USDT")
-        self._write_status_file()
-        logger.info("=== Trading Bot STARTED ===")
-        self._load_historical_candles()
-        self._take_snapshot()
-        self._start_websocket()
+        self.wd.start()
+        self.risk.day_start_balance = get_account_balance("USDT")
+        self._wstatus()
+        self._load_candles()
+        self._snap()
+        logger.info("=== Bot STARTED (REST polling) ===")
+        self._poll_loop()
 
     def stop(self):
         if not self.running:
             return
         self.running = False
-        self.watchdog.stop()
-        if self.websocket_manager:
-            try:
-                self.websocket_manager.stop()
-            except Exception as e:
-                pass
-            self.websocket_manager = None
-        self._take_snapshot()
-        self._write_status_file()
-        logger.info("=== Trading Bot STOPPED ===")
+        self.wd.stop()
+        self._snap()
+        self._wstatus()
+        logger.info("=== Bot STOPPED ===")
 
-    def _load_historical_candles(self):
-        client = get_client()
-        for symbol in self.candles:
+    def _load_candles(self):
+        cl = get_client()
+        for sym in self.candles:
             try:
-                klines = client.get_klines(symbol=symbol, interval=INTERVAL, limit=50)
-                for k in klines:
-                    self.candles[symbol].append(
+                kls = cl.get_klines(symbol=sym, interval=INTERVAL, limit=50)
+                for k in kls:
+                    self.candles[sym].append(
                         {
                             "open": float(k[1]),
                             "high": float(k[2]),
@@ -267,55 +243,160 @@ class BotController:
                             "close_time": k[6],
                         }
                     )
-                logger.info(f"Loaded {len(klines)} candles for {symbol}")
+                self._last_close_times[sym] = kls[-1][6] if kls else 0
+                logger.info(f"Loaded {len(kls)} candles {sym}")
             except Exception as e:
-                logger.error(f"Failed to load candles for {symbol}: {e}")
+                logger.error(f"Load candles {sym}: {e}")
 
-    # ---- CLI ----
-    def manual_close(self, symbol: str) -> bool:
-        session = get_session()
-        pos = (
-            session.query(PositionModel)
-            .filter(PositionModel.symbol == symbol, PositionModel.status == "OPEN")
-            .first()
-        )
+    def _poll_loop(self):
+        cl = get_client()
+        while self.running:
+            try:
+                for sym in self.candles:
+                    kls = cl.get_klines(symbol=sym, interval=INTERVAL, limit=3)
+                    for k in kls:
+                        ct = k[6]
+                        if ct <= self._last_close_times.get(sym, 0):
+                            continue
+                        self._last_close_times[sym] = ct
+                        msg = {
+                            "k": {
+                                "t": k[0],
+                                "T": k[6],
+                                "s": sym,
+                                "o": k[1],
+                                "h": k[2],
+                                "l": k[3],
+                                "c": k[4],
+                                "v": k[5],
+                                "n": k[8],
+                                "x": True,
+                            }
+                        }
+                        self._on_kline(msg)
+            except Exception as e:
+                logger.error(f"Poll error: {e}")
+            time.sleep(POLL_SEC)
+
+    def _on_kline(self, msg):
+        k = msg["k"]
+        sym = k["s"]
+        c = {
+            "open": float(k["o"]),
+            "high": float(k["h"]),
+            "low": float(k["l"]),
+            "close": float(k["c"]),
+            "volume": float(k["v"]),
+        }
+        buf = self.candles[sym]
+        if buf and buf[-1].get("open_time") == k["t"]:
+            buf[-1] = c
+        else:
+            buf.append(c)
+        self._save_candle_db(sym, k, c)
+
+        if len(buf) < 25:
+            return
+
+        cfg = get_config()
+        # Drawdown
+        if self.risk.day_start_balance > 0:
+            self.risk.check_daily_drawdown(get_account_balance("USDT"))
+        # Config reload
+        if (datetime.now(timezone.utc) - self.last_cfg).total_seconds() > CFG_RELOAD_S:
+            reload_from_db()
+            self.last_cfg = datetime.now(timezone.utc)
+        # Breaker
+        if len(buf) >= 15:
+            df = pd.DataFrame(list(buf))
+            atr = (df["high"] - df["low"]).tail(14).mean()
+            if (atr / c["close"]) * 100 > 3.0:
+                self.risk.check_atr_volatility((atr / c["close"]) * 100)
+        if len(buf) >= PRICE_CRASH_CANDLES:
+            self.risk.check_price_crash(
+                sym, c["close"], list(buf)[-PRICE_CRASH_CANDLES]["close"]
+            )
+        if not self.risk.is_trading_allowed()[0]:
+            return
+
+        price = c["close"]
+        s = get_session()
+        pos = s.query(PM).filter(PM.symbol == sym, PM.status == "OPEN").first()
+        if pos:
+            qty = float(pos.quantity)
+            pos.current_price = price
+            pos.unrealized_pnl = (price - float(pos.entry_price)) * qty
+            s.commit()
+            if pos.take_profit and price >= float(pos.take_profit):
+                pnl = float(pos.unrealized_pnl)
+                s.close()
+                self.exec.close_position(pos, price, "take_profit")
+                self.risk.record_trade(pnl)
+                self.trades += 1
+                logger.info(f"TP {sym} @ {price:.2f} PnL={pnl:.2f}")
+                if pnl > 0:
+                    self._fix_profit(pnl)
+                    return
+            if pos.stop_loss and price <= float(pos.stop_loss):
+                pnl = float(pos.unrealized_pnl)
+                s.close()
+                self.exec.close_position(pos, price, "stop_loss")
+                self.risk.record_trade(pnl)
+                self.trades += 1
+                logger.info(f"SL {sym} @ {price:.2f} PnL={pnl:.2f}")
+                if pnl > 0:
+                    self._fix_profit(pnl)
+                    return
+            s.close()
+        else:
+            s.close()
+            df = pd.DataFrame(list(buf))
+            sig = self.strategies[sym].analyze(df)
+            if sig.signal.value == "BUY":
+                logger.info(
+                    f"Signal BUY {sym} @ {sig.price:.2f} ({sig.reason}) SL={sig.stop_loss:.2f} TP={sig.take_profit:.2f}"
+                )
+                if self.exec.open_position(
+                    sym, sig.price, sig.stop_loss, sig.take_profit
+                ):
+                    self.trades += 1
+        self._wstatus()
+        if (datetime.now(timezone.utc) - self.last_snap).total_seconds() > SNAP_S:
+            self._snap()
+
+    def mclose(self, sym):
+        s = get_session()
+        pos = s.query(PM).filter(PM.symbol == sym, PM.status == "OPEN").first()
         if not pos:
-            session.close()
-            print(f"No open position for {symbol}")
+            s.close()
+            print(f"No position: {sym}")
             return False
-        price = get_current_price(symbol)
-        session.close()
-        return self.trade_executor.close_position(pos, price, reason="manual")
+        s.close()
+        return self.exec.close_position(pos, get_current_price(sym), reason="manual")
 
-    def show_status(self):
-        daily = self.risk_manager.get_daily_stats()
-        session = get_session()
-        positions = (
-            session.query(PositionModel).filter(PositionModel.status == "OPEN").all()
-        )
-        session.close()
-        running = False
-        profit_btc = 0.0
+    def sstatus(self):
+        d = self.risk.get_daily_stats()
+        s = get_session()
+        pos = s.query(PM).filter(PM.status == "OPEN").all()
+        s.close()
+        run = False
+        pbtc = 0.0
         if STATUS_FILE.exists():
             try:
-                data = json.loads(STATUS_FILE.read_text())
-                running = data.get("running", False)
-                profit_btc = data.get("profit_btc", 0.0)
-            except Exception as e:
+                j = json.loads(STATUS_FILE.read_text())
+                run = j.get("running", False)
+                pbtc = j.get("profit_btc", 0.0)
+            except:
                 pass
-        balance = get_account_balance("USDT")
-        print(f"\n{'=' * 45}")
-        print(f"  Trading Bot Status ({INTERVAL})")
-        print(f"{'=' * 45}")
-        print(f"  Running: {running} | Network: {'OK' if ping() else 'FAIL'}")
-        print(f"  Balance: {balance:.2f} USDT | Profit: {profit_btc:.8f} BTC")
-        print(f"  Daily trades: {daily['trades']} | Daily PnL: {daily['pnl']} USDT")
-        print(
-            f"  Loss streak: {daily['consecutive_losses']} | Breaker: {daily['breaker']}"
-        )
-        if positions:
-            print(f"\n  Positions ({len(positions)}):")
-            for p in positions:
+        bal = get_account_balance("USDT")
+        print(f"\n{'=' * 45}\n  Bot Status ({INTERVAL})\n{'=' * 45}")
+        print(f"  Running: {run} | Network: {'OK' if ping() else 'FAIL'}")
+        print(f"  Balance: {bal:.2f} USDT | Profit: {pbtc:.8f} BTC")
+        print(f"  Trades: {d['trades']} | PnL: {d['pnl']} USDT")
+        print(f"  Loss streak: {d['consecutive_losses']} | Breaker: {d['breaker']}")
+        if pos:
+            print(f"\n  Positions ({len(pos)}):")
+            for p in pos:
                 print(
                     f"    {p.symbol} entry={float(p.entry_price):.2f} qty={float(p.quantity):.6f} SL={float(p.stop_loss or 0):.2f}"
                 )
@@ -323,205 +404,41 @@ class BotController:
             print("\n  Positions: 0")
         print(f"{'=' * 45}\n")
 
-    def show_logs(self, n: int = 20):
-        session = get_session()
-        logs = session.query(BotLog).order_by(BotLog.created_at.desc()).limit(n).all()
-        session.close()
-        for entry in reversed(logs):
-            print(f"[{entry.level}] [{entry.category or '-'}] {entry.message}")
-
-    # ---- WebSocket ----
-    def _start_websocket(self):
-        cfg = get_config()
-        try:
-            from binance import ThreadedWebsocketManager
-
-            self.websocket_manager = ThreadedWebsocketManager(
-                api_key=cfg.binance.api_key,
-                api_secret=cfg.binance.api_secret,
-                testnet=True,
-            )
-            self.websocket_manager.start()
-            streams = [f"{s.lower()}@kline_{INTERVAL}" for s in cfg.bot.symbols]
-            self.websocket_manager.start_multiplex_socket(
-                callback=self._on_kline, streams=streams
-            )
-            logger.info(f"WebSocket {INTERVAL}: {cfg.bot.symbols}")
-            self.websocket_manager.join()
-        except Exception as e:
-            logger.error(f"WebSocket error: {e}")
-            self.watchdog.record_ws_disconnect()
-
-    def _on_kline(self, msg: dict):
-        logger.info(f"WS msg received")
-        if not self.running:
-            return
-        kline = msg.get("k", {})
-        symbol = kline.get("s", "")
-        if symbol not in self.candles:
-            return
-
-        is_closed = kline.get("x", False)
-        candle = {
-            "open": float(kline.get("o", 0)),
-            "high": float(kline.get("h", 0)),
-            "low": float(kline.get("l", 0)),
-            "close": float(kline.get("c", 0)),
-            "volume": float(kline.get("v", 0)),
-        }
-        self.last_prices[symbol] = candle["close"]
-        buf = self.candles[symbol]
-
-        if is_closed:
-            if (
-                buf
-                and buf[-1]["close"] == candle["close"]
-                and buf[-1]["open"] == candle["open"]
-            ):
-                buf[-1] = candle
-            else:
-                buf.append(candle)
-            logger.info(f"Candle closed: {symbol} @ {candle["close"]}")
-            self._save_candle_to_db(symbol, kline, candle)
-        else:
-            if buf:
-                buf[-1] = candle
-            else:
-                buf.append(candle)
-
-        if not is_closed or len(buf) < 25:
-            return
-
-        cfg = get_config()
-
-        # Daily drawdown (FR-3.6)
-        if self.risk_manager.day_start_balance > 0:
-            self.risk_manager.check_daily_drawdown(get_account_balance("USDT"))
-
-        # Config reload from DB (FR-4.7)
-        if (
-            datetime.now(timezone.utc) - self.last_config_reload
-        ).total_seconds() > CONFIG_RELOAD_SEC:
-            reload_from_db()
-            self.last_config_reload = datetime.now(timezone.utc)
-
-        # Circuit Breaker: ATR
-        if len(buf) >= 15:
-            df_atr = pd.DataFrame(list(buf))
-            atr_val = (df_atr["high"] - df_atr["low"]).tail(14).mean()
-            atr_pct = (atr_val / candle["close"]) * 100
-            if atr_pct > 3.0:
-                self.risk_manager.check_atr_volatility(atr_pct)
-
-        # Circuit Breaker: Price crash (60 candles for 1m = 1 hour)
-        if len(buf) >= PRICE_CRASH_CANDLES:
-            price_n_candles_ago = list(buf)[-PRICE_CRASH_CANDLES]["close"]
-            self.risk_manager.check_price_crash(
-                symbol, candle["close"], price_n_candles_ago
-            )
-
-        if not self.risk_manager.is_trading_allowed()[0]:
-            return
-
-        # Position management
-        close_price = candle["close"]
-        session = get_session()
-        pos = (
-            session.query(PositionModel)
-            .filter(PositionModel.symbol == symbol, PositionModel.status == "OPEN")
-            .first()
-        )
-
-        if pos:
-            qty = float(pos.quantity)
-            pos.current_price = close_price
-            pos.unrealized_pnl = (close_price - float(pos.entry_price)) * qty
-            session.commit()
-
-            if pos.take_profit and close_price >= float(pos.take_profit):
-                realized_pnl = float(pos.unrealized_pnl)
-                session.close()
-                self.trade_executor.close_position(
-                    pos, close_price, reason="take_profit"
-                )
-                self.risk_manager.record_trade(realized_pnl)
-                self.total_trades += 1
-                logger.info(f"TP {symbol} @ {close_price:.2f} PnL={realized_pnl:.2f}")
-                if realized_pnl > 0:
-                    self._fix_profit_to_btc(realized_pnl)
-                return
-            if pos.stop_loss and close_price <= float(pos.stop_loss):
-                realized_pnl = float(pos.unrealized_pnl)
-                session.close()
-                self.trade_executor.close_position(pos, close_price, reason="stop_loss")
-                self.risk_manager.record_trade(realized_pnl)
-                self.total_trades += 1
-                logger.info(f"SL {symbol} @ {close_price:.2f} PnL={realized_pnl:.2f}")
-                if realized_pnl > 0:
-                    self._fix_profit_to_btc(realized_pnl)
-                return
-            session.close()
-        else:
-            session.close()
-            # Use pre-created strategy (not re-creating every candle)
-            strategy = self.strategies[symbol]
-            df = pd.DataFrame(list(buf))
-            signal = strategy.analyze(df)
-            if signal.signal.value == "BUY":
-                logger.info(
-                    f"Signal BUY {symbol} @ {signal.price:.2f} "
-                    f"({signal.reason}) SL={signal.stop_loss:.2f} TP={signal.take_profit:.2f}"
-                )
-                ok = self.trade_executor.open_position(
-                    symbol, signal.price, signal.stop_loss, signal.take_profit
-                )
-                if ok:
-                    self.total_trades += 1
-
-        self._write_status_file()
-
-        # Periodic snapshot
-        if (
-            datetime.now(timezone.utc) - self.last_snapshot
-        ).total_seconds() > SNAPSHOT_INTERVAL_SEC:
-            self._take_snapshot()
-
-
-# ---- CLI Entry Point ----
+    def slogs(self, n=20):
+        s = get_session()
+        logs = s.query(BotLog).order_by(BotLog.created_at.desc()).limit(n).all()
+        s.close()
+        for e in reversed(logs):
+            print(f"[{e.level}] [{e.category or '-'}] {e.message}")
 
 
 def main():
     setup_logging()
     init_db()
-
     cmd = sys.argv[1].lower() if len(sys.argv) >= 2 else ""
-
     if cmd == "status":
-        BotController().show_status()
+        BCtrl().sstatus()
         return
     if cmd == "close" and len(sys.argv) >= 3:
-        BotController().manual_close(sys.argv[2].upper())
+        BCtrl().mclose(sys.argv[2].upper())
         return
     if cmd == "logs":
-        n = int(sys.argv[2]) if len(sys.argv) >= 3 else 20
-        BotController().show_logs(n)
+        BCtrl().slogs(int(sys.argv[2]) if len(sys.argv) >= 3 else 20)
         return
-
     if not ping():
         logger.error("Cannot connect to Binance")
         sys.exit(1)
-    logger.info("Network check passed")
-
-    ctrl = BotController()
+    logger.info("Network OK")
+    c = BCtrl()
     if cmd == "start":
-        ctrl.start()
+        c.start()
         try:
-            while ctrl.running:
+            while c.running:
                 time.sleep(1)
         except KeyboardInterrupt:
-            ctrl.stop()
+            c.stop()
     elif cmd == "stop":
-        ctrl.stop()
+        c.stop()
     else:
         print("Commands: start | stop | status | close SYMBOL | logs N")
 
