@@ -12,13 +12,14 @@ Usage:
 from __future__ import annotations
 
 import json
-import os
 import sys
 import threading
 import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pandas as pd
 from loguru import logger
 from src.binance_client import get_current_price, ping
 from src.config import get_config
@@ -29,31 +30,25 @@ from src.risk_manager import RiskManager
 from src.strategy.bollinger_rsi import BollingerRSIStrategy
 from src.trade_executor import TradeExecutor
 
-# Network watchdog
 PING_INTERVAL_SEC = 30
 MAX_PING_FAILURES = 3
 MAX_WS_RECONNECTS = 5
 WS_RECONNECT_WINDOW_MIN = 10
+MAX_CANDLES = 100  # Buffer size per symbol
 
-# Status file for inter-process communication
 STATUS_FILE = Path(__file__).resolve().parents[1] / "bot_status.json"
 
 
 class NetworkWatchdog:
-    """Monitors ping failures and WebSocket reconnect storms."""
-
     def __init__(self, controller: "BotController"):
         self.controller = controller
         self._stop_event = threading.Event()
-        self._thread: threading.Thread | None = None
         self.ping_failures = 0
         self.ws_disconnects: list[datetime] = []
 
     def start(self):
         self._stop_event.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        logger.info("Network watchdog started")
+        threading.Thread(target=self._run, daemon=True).start()
 
     def stop(self):
         self._stop_event.set()
@@ -71,22 +66,19 @@ class NetworkWatchdog:
                     f"Ping failed ({self.ping_failures}/{MAX_PING_FAILURES})"
                 )
             if self.ping_failures >= MAX_PING_FAILURES:
-                logger.critical("NETWORK LOST — stopping bot")
+                logger.critical("NETWORK LOST")
                 self.controller.stop()
                 return
-            self._prune_disconnects()
+            cutoff = datetime.now(timezone.utc) - timedelta(
+                minutes=WS_RECONNECT_WINDOW_MIN
+            )
+            self.ws_disconnects = [t for t in self.ws_disconnects if t > cutoff]
 
     def record_ws_disconnect(self):
-        now = datetime.now(timezone.utc)
-        self.ws_disconnects.append(now)
-        self._prune_disconnects()
+        self.ws_disconnects.append(datetime.now(timezone.utc))
         if len(self.ws_disconnects) >= MAX_WS_RECONNECTS:
-            logger.critical(f"NETWORK UNSTABLE — stopping bot")
+            logger.critical("NETWORK UNSTABLE")
             self.controller.stop()
-
-    def _prune_disconnects(self):
-        cutoff = datetime.now(timezone.utc) - timedelta(minutes=WS_RECONNECT_WINDOW_MIN)
-        self.ws_disconnects = [t for t in self.ws_disconnects if t > cutoff]
 
 
 class BotController:
@@ -99,12 +91,13 @@ class BotController:
         self._ws_twm = None
         self._started_at: datetime | None = None
         self._total_trades = 0
+        self._candles: dict[str, deque[dict]] = {}  # symbol → candle buffer
         cfg = get_config()
         for symbol in cfg.bot.symbols:
             self.strategies[symbol] = BollingerRSIStrategy(symbol=symbol)
+            self._candles[symbol] = deque(maxlen=MAX_CANDLES)
 
-    def _write_status(self, extra: dict | None = None):
-        """Write current status to JSON file for external status checks."""
+    def _write_status(self):
         data = {
             "running": self.running,
             "started_at": self._started_at.isoformat() if self._started_at else None,
@@ -112,17 +105,11 @@ class BotController:
             "ws_disconnects_10m": len(self.watchdog.ws_disconnects),
             "total_trades": self._total_trades,
             **(self.risk_manager.get_daily_stats()),
-            **(extra or {}),
         }
         STATUS_FILE.write_text(json.dumps(data, indent=2))
 
-    def _delete_status(self):
-        if STATUS_FILE.exists():
-            STATUS_FILE.unlink()
-
     def start(self):
         if self.running:
-            print("Bot already running")
             return
         if not ping():
             print("ERROR: Cannot connect to Binance")
@@ -132,6 +119,8 @@ class BotController:
         self.watchdog.start()
         self._write_status()
         logger.info("=== Trading Bot STARTED ===")
+        # Load initial historical candles
+        self._load_initial_candles()
         self._init_websocket()
 
     def stop(self):
@@ -145,8 +134,30 @@ class BotController:
             except Exception:
                 pass
             self._ws_twm = None
-        self._write_status({"stopped_at": datetime.now(timezone.utc).isoformat()})
+        self._write_status()
         logger.info("=== Trading Bot STOPPED ===")
+
+    def _load_initial_candles(self):
+        """Fetch last 50 candles via REST to prime the buffer."""
+        from src.binance_client import get_client
+
+        client = get_client()
+        for symbol in self._candles:
+            try:
+                klines = client.get_klines(symbol=symbol, interval="5m", limit=50)
+                for k in klines:
+                    self._candles[symbol].append(
+                        {
+                            "open": float(k[1]),
+                            "high": float(k[2]),
+                            "low": float(k[3]),
+                            "close": float(k[4]),
+                            "volume": float(k[5]),
+                        }
+                    )
+                logger.info(f"Loaded {len(klines)} historical candles for {symbol}")
+            except Exception as e:
+                logger.error(f"Failed to load candles for {symbol}: {e}")
 
     def manual_close(self, symbol: str) -> bool:
         session = get_session()
@@ -167,24 +178,18 @@ class BotController:
         positions = (
             session.query(PositionModel).filter(PositionModel.status == "OPEN").all()
         )
-
-        # Try to read running status from file
         running = False
         if STATUS_FILE.exists():
             try:
-                data = json.loads(STATUS_FILE.read_text())
-                running = data.get("running", False)
+                running = json.loads(STATUS_FILE.read_text()).get("running", False)
             except Exception:
                 pass
-
         ping_ok = ping()
-        ws_dc = len(self.watchdog.ws_disconnects)
-
         print(f"\n{'=' * 40}")
         print(" Trading Bot Status")
         print(f"{'=' * 40}")
         print(f" Running: {running}")
-        print(f" Network: {'OK' if ping_ok else 'FAIL'} | WS DC (10m): {ws_dc}")
+        print(f" Network: {'OK' if ping_ok else 'FAIL'}")
         print(f" Daily trades: {daily['trades']} | PnL: {daily['pnl']} USDT")
         print(
             f" Loss streak: {daily['consecutive_losses']} | Breaker: {daily['breaker']}"
@@ -197,6 +202,13 @@ class BotController:
                 )
         else:
             print("\n Open positions: 0")
+        # Buffer sizes
+        print(
+            f"\n Candle buffers: "
+            + " | ".join(
+                f"{s}={len(self._candles.get(s, []))}" for s in self.strategies
+            )
+        )
         print(f"{'=' * 40}\n")
 
     def show_logs(self, n: int = 20):
@@ -233,18 +245,49 @@ class BotController:
             return
         data = msg.get("data", {})
         kline = data.get("k", {})
-        if not kline or not kline.get("x"):
-            return
-
         symbol = kline.get("s", "")
         if symbol not in self.strategies:
             return
+
+        # Only use closed candles for trading decisions
+        is_closed = kline.get("x", False)
+        candle = {
+            "open": float(kline.get("o", 0)),
+            "high": float(kline.get("h", 0)),
+            "low": float(kline.get("l", 0)),
+            "close": float(kline.get("c", 0)),
+            "volume": float(kline.get("v", 0)),
+        }
+
+        # Update buffer (replace or append)
+        buf = self._candles[symbol]
+        if is_closed:
+            if (
+                buf
+                and buf[-1]["close"] == candle["close"]
+                and buf[-1]["open"] == candle["open"]
+            ):
+                buf[-1] = candle  # Update last
+            else:
+                buf.append(candle)
+        else:
+            # Live candle: update last if matching time, else append
+            if buf:
+                buf[-1] = candle
+            else:
+                buf.append(candle)
+
+        if not is_closed:
+            return  # Only trade on closed candles
+
+        if len(buf) < 25:
+            return  # Need enough data
 
         allowed, _ = self.risk_manager.is_trading_allowed()
         if not allowed:
             return
 
-        close_price = float(kline.get("c", 0))
+        close_price = candle["close"]
         session = get_session()
         pos = (
             session.query(PositionModel)
@@ -257,45 +300,38 @@ class BotController:
             pos.current_price = close_price
             pos.unrealized_pnl = (close_price - float(pos.entry_price)) * qty
             session.commit()
-            self._write_status({"last_price": {symbol: close_price}})
 
             if pos.take_profit and close_price >= float(pos.take_profit):
                 self.executor.close_position(pos, close_price, reason="take_profit")
                 self.risk_manager.record_trade(float(pos.unrealized_pnl))
                 self._total_trades += 1
-                logger.info(f"TP {symbol} PnL={pos.unrealized_pnl:.2f}")
+                logger.info(
+                    f"TP {symbol} @ {close_price:.2f} PnL={pos.unrealized_pnl:.2f}"
+                )
                 return
             if pos.stop_loss and close_price <= float(pos.stop_loss):
                 self.executor.close_position(pos, close_price, reason="stop_loss")
                 self.risk_manager.record_trade(float(pos.unrealized_pnl))
                 self._total_trades += 1
-                logger.info(f"SL {symbol} PnL={pos.unrealized_pnl:.2f}")
+                logger.info(
+                    f"SL {symbol} @ {close_price:.2f} PnL={pos.unrealized_pnl:.2f}"
+                )
                 return
         else:
-            import pandas as pd
-
-            df = pd.DataFrame(
-                [
-                    {
-                        "open": float(kline.get("o", 0)),
-                        "high": float(kline.get("h", 0)),
-                        "low": float(kline.get("l", 0)),
-                        "close": close_price,
-                        "volume": float(kline.get("v", 0)),
-                    }
-                ]
-            )
+            df = pd.DataFrame(list(buf))
             signal = self.strategies[symbol].analyze(df)
             if signal.signal.value == "BUY":
+                logger.info(
+                    f"Signal: {signal.signal.value} {symbol} @ {signal.price:.2f} "
+                    f"R={signal.reason} SL={signal.stop_loss:.2f} TP={signal.take_profit:.2f}"
+                )
                 ok = self.executor.open_position(
                     symbol, signal.price, signal.stop_loss, signal.take_profit
                 )
                 if ok:
                     self._total_trades += 1
-                    logger.info(
-                        f"BUY {symbol} @ {signal.price:.2f} SL={signal.stop_loss:.2f} TP={signal.take_profit:.2f}"
-                    )
-            self._write_status({"last_price": {symbol: close_price}})
+
+        self._write_status()
 
 
 def main():
@@ -304,29 +340,22 @@ def main():
 
     cmd = sys.argv[1].lower() if len(sys.argv) >= 2 else ""
 
-    # Status / close / logs don't need a live controller
     if cmd == "status":
-        controller = BotController()
-        controller.show_status()
+        BotController().show_status()
         return
     if cmd == "close" and len(sys.argv) >= 3:
-        controller = BotController()
-        controller.manual_close(sys.argv[2].upper())
+        BotController().manual_close(sys.argv[2].upper())
         return
     if cmd == "logs":
-        controller = BotController()
-        n = int(sys.argv[2]) if len(sys.argv) >= 3 else 20
-        controller.show_logs(n)
+        BotController().show_logs(int(sys.argv[2]) if len(sys.argv) >= 3 else 20)
         return
 
-    # Start needs full init
     if not ping():
         logger.error("Cannot connect to Binance")
         sys.exit(1)
     logger.info("Network check passed")
 
     controller = BotController()
-
     if cmd == "start":
         controller.start()
         try:
