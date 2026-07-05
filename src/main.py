@@ -381,6 +381,7 @@ class BotController:
                 buf[-1] = candle
             else:
                 buf.append(candle)
+            logger.info(f"Candle closed: {symbol} @ {candle["close"]}")
             self._save_candle_to_db(symbol, kline, candle)
         else:
             if buf:
