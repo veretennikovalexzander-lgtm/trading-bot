@@ -1,0 +1,9 @@
+﻿python-binance==1.0.19
+python-dotenv==1.0.0
+psycopg2-binary==2.9.9
+sqlalchemy==2.0.25
+alembic==1.13.1
+pandas==2.2.0
+numpy==1.26.3
+requests==2.31.0
+loguru==0.7.2
