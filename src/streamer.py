@@ -117,7 +117,7 @@ class WebSocketStreamer:
         if symbol not in self.controller.strategies:
             return
 
-        close_time = kline.get("T", 0) // 1000
+        close_time = kline.get("T", 0)
         if close_time <= self.controller.last_close_times.get(symbol, 0):
             return
         self.controller.last_close_times[symbol] = close_time
