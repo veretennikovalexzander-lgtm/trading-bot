@@ -88,6 +88,7 @@ class WebSocketStreamer:
                     backoff = RECONNECT_DELAY
                     async for raw in ws:
                         if not self.controller.running:
+                        if self._msg_count == 1: logger.info("DEBUG: first message received")
                             break
                         self._msg_count += 1
                         try:
@@ -97,6 +98,7 @@ class WebSocketStreamer:
             except Exception as e:
                 logger.error(f"WebSocket error: {e}")
             if not self.controller.running:
+                        if self._msg_count == 1: logger.info("DEBUG: first message received")
                 break
             logger.warning(f"Reconnecting in {backoff}s...")
             await asyncio.sleep(backoff)
