@@ -23,7 +23,8 @@ def get_client() -> Client:
             api_secret=cfg.binance.api_secret,
             testnet=cfg.binance.testnet,
         )
-        logger.info(f"Binance client initialized (testnet={cfg.binance.testnet})")
+        key_masked = cfg.binance.api_key[:4] + "****" + cfg.binance.api_key[-4:] if len(cfg.binance.api_key) > 8 else "****"
+        logger.info(f"Binance client initialized (testnet={cfg.binance.testnet}, key={key_masked})")
     return _client
 
 

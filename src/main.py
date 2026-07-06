@@ -19,9 +19,32 @@ from src.poller import MarketPoller
 from src.profit import ProfitManager
 
 
+def _validate_config():
+    """Security: refuse to start with default/placeholder API keys."""
+    cfg = get_config()
+    dangerous_values = (
+        "your_api_key_here",
+        "your_api_secret_here",
+        "your_password_here",
+        "your_telegram_bot_token_here",
+        "your_chat_id_here",
+    )
+    if cfg.binance.api_key.lower() in dangerous_values or cfg.binance.api_key == "":
+        logger.error("SECURITY: Binance API key not set. Edit .env file.")
+        sys.exit(1)
+    if (
+        cfg.binance.api_secret.lower() in dangerous_values
+        or cfg.binance.api_secret == ""
+    ):
+        logger.error("SECURITY: Binance API secret not set. Edit .env file.")
+        sys.exit(1)
+    logger.info("API keys validated")
+
+
 def run_bot():
     """Start the trading bot: controller + watchdog + poller."""
     setup_logging()
+    _validate_config()
     init_db()
 
     if not ping():
@@ -32,16 +55,11 @@ def run_bot():
     controller = BotController()
     profit_manager = ProfitManager()
     controller.risk_manager.day_start_balance = get_account_balance("USDT")
-
-    # Network watchdog
     watchdog = NetworkWatchdog(on_critical=controller.stop)
-
-    # Market poller
     poller = MarketPoller(
         controller, profit_manager, on_position_closed=lambda pnl: None
     )
 
-    # Start
     controller.running = True
     controller.started_at = datetime.now(timezone.utc)
     watchdog.start()
