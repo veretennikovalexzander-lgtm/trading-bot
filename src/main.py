@@ -1,6 +1,6 @@
 """
-Trading Bot — main controller (REST polling, 1m candles).
-Full requirements: profit fixation to BTC via Funding wallet.
+Trading Bot — REST polling, 1m candles.
+Profit: BTCUSDT → BTC (Funding), ETHUSDT → USDT (Funding).
 """
 
 from __future__ import annotations
@@ -39,10 +39,9 @@ MAX_PF = 3
 MAX_CANDLES = 100
 PRICE_CRASH_CANDLES = 60
 SNAP_S = 6 * 3600
-CFG_RELOAD_S = 300
 
 STATUS_FILE = Path(__file__).resolve().parents[1] / "bot_status.json"
-PROFIT_FILE = Path(__file__).resolve().parents[1] / "profit_btc.json"
+PROFIT_FILE = Path(__file__).resolve().parents[1] / "profit_state.json"
 
 
 class Nwd:
@@ -83,11 +82,10 @@ class BCtrl:
         self.started_at = None
         self.trades = 0
         self.pbtc = 0.0
-        self.pusdt = 0.0
+        self.pusdt = 0.0  # Accumulated profit
         self.candles: dict[str, deque[dict]] = {}
         self.strategies: dict[str, BollingerRSIStrategy] = {}
         self.last_snap = datetime.min.replace(tzinfo=timezone.utc)
-        self.last_cfg = datetime.min.replace(tzinfo=timezone.utc)
         self._last_close_times: dict[str, int] = {}
         cfg = get_config()
         for s in cfg.bot.symbols:
@@ -95,12 +93,12 @@ class BCtrl:
             self.strategies[s] = BollingerRSIStrategy(symbol=s, interval=INTERVAL)
         self._load_profit()
 
-    # --- Profit: USDT → buy BTC → transfer to Funding wallet ---
-
     def _load_profit(self):
         if PROFIT_FILE.exists():
             try:
-                self.pbtc = json.loads(PROFIT_FILE.read_text()).get("total_btc", 0.0)
+                d = json.loads(PROFIT_FILE.read_text())
+                self.pbtc = d.get("total_btc", 0.0)
+                self.pusdt = d.get("total_usdt", 0.0)
             except Exception:
                 pass
 
@@ -109,78 +107,50 @@ class BCtrl:
             json.dumps(
                 {
                     "total_btc": round(self.pbtc, 8),
+                    "total_usdt": round(self.pusdt, 4),
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 },
                 indent=2,
             )
         )
 
-    def _fix_profit(self, profit_usdt: float):
-        """Convert profit USDT → buy BTC → transfer to Funding wallet."""
+    def _fix_profit(self, profit_usdt: float, symbol: str):
+        """Fix profit: BTCUSDT → buy BTC → Funding, ETHUSDT → USDT → Funding."""
         if profit_usdt <= 0:
             return
 
-        cfg = get_config()
-        min_trade = 15.0  # Min notional for BTCUSDT
-
-        if profit_usdt < min_trade:
-            logger.info(f"Profit {profit_usdt:.2f} USDT too small, accumulating")
-            self.pusdt += profit_usdt
-            # Try again when accumulated enough
-            if self.pusdt >= min_trade:
-                accumulated = self.pusdt
-                self.pusdt = 0
-                return self._fix_profit(accumulated)
-            return
-
-        total_to_trade = profit_usdt + self.pusdt
-        self.pusdt = 0
-
-        # Step 1: Buy BTC with profit USDT
-        logger.info(f"Buying BTC for {total_to_trade:.2f} USDT → Funding wallet")
-        order = place_market_buy("BTCUSDT", total_to_trade)
-        if not order:
-            logger.error("Failed to buy BTC for profit fixation")
-            self.pusdt += total_to_trade  # Keep for next attempt
-            return
-
-        fills = order.get("fills", [])
-        if not fills:
-            logger.error("No fills for profit BTC purchase")
-            self.pusdt += total_to_trade
-            return
-
-        btc_bought = sum(float(f["qty"]) for f in fills)
-
-        # Step 2: Transfer BTC to Funding wallet
-        transferred = transfer_to_funding("BTC", btc_bought)
-        if transferred:
+        if "BTC" in symbol:
+            # BTCUSDT: buy BTC and transfer
+            min_trade = 15.0
+            if profit_usdt < min_trade:
+                logger.info(f"BTC profit {profit_usdt:.2f} too small, accumulating")
+                return
+            logger.info(f"Buying BTC for {profit_usdt:.2f} USDT → Funding")
+            order = place_market_buy("BTCUSDT", profit_usdt)
+            if not order or not order.get("fills"):
+                logger.error("Failed to buy BTC for profit")
+                return
+            btc_bought = sum(float(f["qty"]) for f in order["fills"])
+            transferred = transfer_to_funding("BTC", btc_bought)
             self.pbtc += btc_bought
-            self._save_profit()
             logger.info(
-                f"PROFIT: {total_to_trade:.2f} USDT → {btc_bought:.8f} BTC → Funding | Total: {self.pbtc:.8f} BTC"
+                f"PROFIT BTC: {profit_usdt:.2f} USDT → {btc_bought:.8f} BTC → Funding | Total: {self.pbtc:.8f} BTC"
             )
+            msg = f"+{profit_usdt:.2f} USDT → {btc_bought:.8f} BTC (Funding) | Total: {self.pbtc:.8f} BTC"
         else:
-            # Transfer failed — BTC stays on Spot (still secured)
-            self.pbtc += btc_bought
-            self._save_profit()
-            logger.warning(
-                f"Transfer to Funding failed, BTC stays on Spot: {btc_bought:.8f}"
+            # ETHUSDT: transfer USDT directly to Funding
+            transferred = transfer_to_funding("USDT", profit_usdt)
+            self.pusdt += profit_usdt
+            logger.info(
+                f"PROFIT USDT: {profit_usdt:.2f} USDT → Funding | Total: {self.pusdt:.2f} USDT"
             )
+            msg = f"+{profit_usdt:.2f} USDT → Funding | Total: {self.pusdt:.2f} USDT"
 
-        # Log
+        self._save_profit()
         s = get_session()
-        s.add(
-            BotLog(
-                level="INFO",
-                category="profit",
-                message=f"+{total_to_trade:.2f} USDT → {btc_bought:.8f} BTC (Funding) | Total: {self.pbtc:.8f} BTC",
-            )
-        )
+        s.add(BotLog(level="INFO", category="profit", message=msg))
         s.commit()
         s.close()
-
-    # --- Snapshots ---
 
     def _snap(self):
         try:
@@ -201,8 +171,6 @@ class BCtrl:
             logger.info(f"Snapshot: {bal:.2f} USDT")
         except Exception as e:
             logger.error(f"Snapshot: {e}")
-
-    # --- Candle DB ---
 
     def _save_candle_db(self, sym, k, c):
         try:
@@ -269,7 +237,7 @@ class BCtrl:
         self._wstatus()
         self._load_candles()
         self._snap()
-        logger.info("=== Bot STARTED (REST polling, 1m) ===")
+        logger.info("=== Bot STARTED (1m) ===")
         self._poll_loop()
 
     def stop(self):
@@ -286,7 +254,6 @@ class BCtrl:
         for sym in self.candles:
             try:
                 kls = cl.get_klines(symbol=sym, interval=INTERVAL, limit=50)
-                logger.info(f"Poll {sym}: got {len(kls)} klines")
                 for k in kls:
                     self.candles[sym].append(
                         {
@@ -332,7 +299,7 @@ class BCtrl:
                             }
                         )
             except Exception as e:
-                logger.error(f"Poll error: {e}")
+                logger.error(f"Poll: {e}")
             time.sleep(POLL_SEC)
 
     def _on_kline(self, msg):
@@ -355,16 +322,13 @@ class BCtrl:
         if len(buf) < 25:
             return
 
-        # Drawdown
         if self.risk.day_start_balance > 0:
             self.risk.check_daily_drawdown(get_account_balance("USDT"))
-        # ATR breaker
         if len(buf) >= 15:
             df = pd.DataFrame(list(buf))
             atr = (df["high"] - df["low"]).tail(14).mean()
             if (atr / c["close"]) * 100 > 3.0:
                 self.risk.check_atr_volatility((atr / c["close"]) * 100)
-        # Price crash
         if len(buf) >= PRICE_CRASH_CANDLES:
             self.risk.check_price_crash(
                 sym, c["close"], list(buf)[-PRICE_CRASH_CANDLES]["close"]
@@ -388,7 +352,7 @@ class BCtrl:
                 self.trades += 1
                 logger.info(f"TP {sym} @ {price:.2f} PnL={pnl:.2f}")
                 if pnl > 0:
-                    self._fix_profit(pnl)
+                    self._fix_profit(pnl, sym)
                 return
             if pos.stop_loss and price <= float(pos.stop_loss):
                 pnl = float(pos.unrealized_pnl)
@@ -398,7 +362,7 @@ class BCtrl:
                 self.trades += 1
                 logger.info(f"SL {sym} @ {price:.2f} PnL={pnl:.2f}")
                 if pnl > 0:
-                    self._fix_profit(pnl)
+                    self._fix_profit(pnl, sym)
                 return
             s.close()
         else:
@@ -406,9 +370,7 @@ class BCtrl:
             df = pd.DataFrame(list(buf))
             sig = self.strategies[sym].analyze(df)
             if sig.signal.value == "BUY":
-                logger.info(
-                    f"Signal BUY {sym} @ {sig.price:.2f} ({sig.reason}) SL={sig.stop_loss:.2f} TP={sig.take_profit:.2f}"
-                )
+                logger.info(f"Signal BUY {sym} @ {sig.price:.2f} ({sig.reason})")
                 if self.exec.open_position(
                     sym, sig.price, sig.stop_loss, sig.take_profit
                 ):
@@ -444,11 +406,11 @@ class BCtrl:
             except Exception:
                 pass
         bal = get_account_balance("USDT")
-        print(f"\n{'=' * 45}\n  Bot Status ({INTERVAL})\n{'=' * 45}")
+        print(f"\n{'=' * 50}\n  Bot Status ({INTERVAL})\n{'=' * 50}")
         print(f"  Running: {run} | Network: {'OK' if ping() else 'FAIL'}")
-        print(
-            f"  Balance: {bal:.2f} USDT | Profit: {pbtc:.8f} BTC | Pending: {pusdt:.2f} USDT"
-        )
+        print(f"  Balance: {bal:.2f} USDT")
+        print(f"  Profit BTC (Funding): {pbtc:.8f} BTC")
+        print(f"  Profit USDT (Funding): {pusdt:.2f} USDT")
         print(f"  Trades: {d['trades']} | PnL: {d['pnl']} USDT")
         print(f"  Loss streak: {d['consecutive_losses']} | Breaker: {d['breaker']}")
         if pos:
@@ -459,7 +421,7 @@ class BCtrl:
                 )
         else:
             print("\n  Positions: 0")
-        print(f"{'=' * 45}\n")
+        print(f"{'=' * 50}\n")
 
     def slogs(self, n=20):
         s = get_session()
