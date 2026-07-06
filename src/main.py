@@ -216,8 +216,8 @@ class BCtrl:
     def _poll(self):
         cl = get_client()
         while self.running:
-            try:
-                for s in self.candles:
+            for s in list(self.candles.keys()):
+                try:
                     ks = cl.get_klines(symbol=s, interval=I, limit=3)
                     for k in ks:
                         ct = k[6]
@@ -240,144 +240,153 @@ class BCtrl:
                                 }
                             }
                         )
-            except Exception as e:
-                logger.error(f"Poll: {e}")
+                except Exception as e:
+                    logger.error(f"Poll {s}: {e}")
             time.sleep(PS)
 
     def _ok(self, msg):
-        k = msg["k"]
-        sym = k["s"]
-        c = {
-            "open": float(k["open"]),
-            "high": float(k["high"]),
-            "low": float(k["low"]),
-            "close": float(k["close"]),
-            "volume": float(k["volume"]),
-        }
-        buf = self.candles[sym]
-        if buf and buf[-1].get("ot") == k["t"]:
-            buf[-1] = c
-        else:
-            buf.append(c)
-        if len(buf) < 25:
-            return
-        # Verbose every 60s
-        now = datetime.now(timezone.utc)
-        if (now - self.lstatus).total_seconds() >= 60:
-            self.lstatus = now
-            df = pd.DataFrame(list(buf))
-            try:
-                import pandas_ta as ta
-
-                cs = df["close"]
-                bb = ta.bbands(cs, length=20, std=2)
-                rs = ta.rsi(cs, length=14)
-                blc, bmc = _bb_cols(bb) if bb is not None else (None, None)
-                lo = float(bb.iloc[-1][blc]) if blc else 0
-                mi = float(bb.iloc[-1][bmc]) if bmc else 0
-                rv = (
-                    float(rs.iloc[-1])
-                    if rs is not None and not pd.isna(rs.iloc[-1])
-                    else 0
-                )
-                sig = "BUY" if lo and c["close"] <= lo and rv < 35 else "HOLD"
-                ps = ""
-                s = get_session()
-                p = s.query(PM).filter(PM.symbol == sym, PM.status == "OPEN").first()
-                if p:
-                    ps = f" | POS: ent={float(p.entry_price):.2f} SL={float(p.stop_loss or 0):.2f}"
-                s.close()
-                logger.info(
-                    f"[{sym}] {c['close']:.2f} | BB:{lo:.2f}/{mi:.2f} | RSI:{rv:.1f} | {sig}{ps}"
-                )
-            except Exception as ex:
-                logger.info(f"[{sym}] {c['close']:.2f} | ind fail: {ex}")
-        # Save candle to DB
         try:
-            s = get_session()
-            ot = datetime.fromtimestamp(k["t"] / 1000, tz=timezone.utc)
-            if (
-                not s.query(MarketData)
-                .filter(
-                    MarketData.symbol == sym,
-                    MarketData.interval == I,
-                    MarketData.open_time == ot,
-                )
-                .first()
-            ):
-                s.add(
-                    MarketData(
-                        symbol=sym,
-                        interval=I,
-                        open_time=ot,
-                        close_time=datetime.fromtimestamp(
-                            k["T"] / 1000, tz=timezone.utc
-                        ),
-                        open=c["open"],
-                        high=c["high"],
-                        low=c["low"],
-                        close=c["close"],
-                        volume=c["volume"],
-                        trades_count=k.get("n", 0),
+            k = msg["k"]
+            sym = k["s"]
+            c = {
+                "open": float(k["open"]),
+                "high": float(k["high"]),
+                "low": float(k["low"]),
+                "close": float(k["close"]),
+                "volume": float(k["volume"]),
+            }
+            buf = self.candles[sym]
+            if buf and buf[-1].get("ot") == k["t"]:
+                buf[-1] = c
+            else:
+                buf.append(c)
+            if len(buf) < 25:
+                return
+            # Verbose every 60s
+            now = datetime.now(timezone.utc)
+            if (now - self.lstatus).total_seconds() >= 60:
+                self.lstatus = now
+                df = pd.DataFrame(list(buf))
+                try:
+                    import pandas_ta as ta
+
+                    cs = df["close"]
+                    bb = ta.bbands(cs, length=20, std=2)
+                    rs = ta.rsi(cs, length=14)
+                    blc, bmc = _bb_cols(bb) if bb is not None else (None, None)
+                    lo = float(bb.iloc[-1][blc]) if blc else 0
+                    mi = float(bb.iloc[-1][bmc]) if bmc else 0
+                    rv = (
+                        float(rs.iloc[-1])
+                        if rs is not None and not pd.isna(rs.iloc[-1])
+                        else 0
                     )
-                )
+                    sig = "BUY" if lo and c["close"] <= lo and rv < 35 else "HOLD"
+                    ps = ""
+                    s = get_session()
+                    p = (
+                        s.query(PM)
+                        .filter(PM.symbol == sym, PM.status == "OPEN")
+                        .first()
+                    )
+                    if p:
+                        ps = f" | POS: ent={float(p.entry_price):.2f} SL={float(p.stop_loss or 0):.2f}"
+                    s.close()
+                    logger.info(
+                        f"[{sym}] {c['close']:.2f} | BB:{lo:.2f}/{mi:.2f} | RSI:{rv:.1f} | {sig}{ps}"
+                    )
+                except Exception as ex:
+                    logger.info(f"[{sym}] {c['close']:.2f} | ind fail: {ex}")
+            # Save candle to DB
+            try:
+                s = get_session()
+                ot = datetime.fromtimestamp(k["t"] / 1000, tz=timezone.utc)
+                if (
+                    not s.query(MarketData)
+                    .filter(
+                        MarketData.symbol == sym,
+                        MarketData.interval == I,
+                        MarketData.open_time == ot,
+                    )
+                    .first()
+                ):
+                    s.add(
+                        MarketData(
+                            symbol=sym,
+                            interval=I,
+                            open_time=ot,
+                            close_time=datetime.fromtimestamp(
+                                k["T"] / 1000, tz=timezone.utc
+                            ),
+                            open=c["open"],
+                            high=c["high"],
+                            low=c["low"],
+                            close=c["close"],
+                            volume=c["volume"],
+                            trades_count=k.get("n", 0),
+                        )
+                    )
+                    s.commit()
+                s.close()
+            except Exception:
+                pass
+            # Risk checks
+            if self.risk.day_start_balance > 0:
+                self.risk.check_daily_drawdown(get_account_balance("USDT"))
+            if len(buf) >= 15:
+                df = pd.DataFrame(list(buf))
+                atr = (df["high"] - df["low"]).tail(14).mean()
+                if (atr / c["close"]) * 100 > 3.0:
+                    self.risk.check_atr_volatility((atr / c["close"]) * 100)
+            if len(buf) >= PCC:
+                self.risk.check_price_crash(sym, c["close"], list(buf)[-PCC]["close"])
+            if not self.risk.is_trading_allowed()[0]:
+                return
+            # Position management
+            pr = c["close"]
+            s = get_session()
+            pos = s.query(PM).filter(PM.symbol == sym, PM.status == "OPEN").first()
+            if pos:
+                q = float(pos.quantity)
+                pos.current_price = pr
+                pos.unrealized_pnl = (pr - float(pos.entry_price)) * q
                 s.commit()
-            s.close()
-        except Exception:
-            pass
-        # Risk checks
-        if self.risk.day_start_balance > 0:
-            self.risk.check_daily_drawdown(get_account_balance("USDT"))
-        if len(buf) >= 15:
-            df = pd.DataFrame(list(buf))
-            atr = (df["high"] - df["low"]).tail(14).mean()
-            if (atr / c["close"]) * 100 > 3.0:
-                self.risk.check_atr_volatility((atr / c["close"]) * 100)
-        if len(buf) >= PCC:
-            self.risk.check_price_crash(sym, c["close"], list(buf)[-PCC]["close"])
-        if not self.risk.is_trading_allowed()[0]:
-            return
-        # Position management
-        pr = c["close"]
-        s = get_session()
-        pos = s.query(PM).filter(PM.symbol == sym, PM.status == "OPEN").first()
-        if pos:
-            q = float(pos.quantity)
-            pos.current_price = pr
-            pos.unrealized_pnl = (pr - float(pos.entry_price)) * q
-            s.commit()
-            if pos.take_profit and pr >= float(pos.take_profit):
-                pnl = float(pos.unrealized_pnl)
-                s.close()
-                self.exec.close_position(pos, pr, "tp")
-                self.risk.record_trade(pnl)
-                self.trades += 1
-                logger.info(f"TP {sym} @{pr:.2f} PnL={pnl:.2f}")
-                if pnl > 0:
-                    self._fp(pnl, sym)
-                    return
-            if pos.stop_loss and pr <= float(pos.stop_loss):
-                pnl = float(pos.unrealized_pnl)
-                s.close()
-                self.exec.close_position(pos, pr, "sl")
-                self.risk.record_trade(pnl)
-                self.trades += 1
-                logger.info(f"SL {sym} @{pr:.2f} PnL={pnl:.2f}")
-                if pnl > 0:
-                    self._fp(pnl, sym)
-                    return
-            s.close()
-        else:
-            s.close()
-            df = pd.DataFrame(list(buf))
-            sg = self.strategies[sym].analyze(df)
-            if sg.signal.value == "BUY":
-                logger.info(f">>BUY {sym} @{sg.price:.2f} ({sg.reason})")
-                if self.exec.open_position(sym, sg.price, sg.stop_loss, sg.take_profit):
+                if pos.take_profit and pr >= float(pos.take_profit):
+                    pnl = float(pos.unrealized_pnl)
+                    s.close()
+                    self.exec.close_position(pos, pr, "tp")
+                    self.risk.record_trade(pnl)
                     self.trades += 1
-        self._ws()
-        if (datetime.now(timezone.utc) - self.lsnap).total_seconds() > SS:
-            self._snap()
+                    logger.info(f"TP {sym} @{pr:.2f} PnL={pnl:.2f}")
+                    if pnl > 0:
+                        self._fp(pnl, sym)
+                        return
+                if pos.stop_loss and pr <= float(pos.stop_loss):
+                    pnl = float(pos.unrealized_pnl)
+                    s.close()
+                    self.exec.close_position(pos, pr, "sl")
+                    self.risk.record_trade(pnl)
+                    self.trades += 1
+                    logger.info(f"SL {sym} @{pr:.2f} PnL={pnl:.2f}")
+                    if pnl > 0:
+                        self._fp(pnl, sym)
+                        return
+                s.close()
+            else:
+                s.close()
+                df = pd.DataFrame(list(buf))
+                sg = self.strategies[sym].analyze(df)
+                if sg.signal.value == "BUY":
+                    logger.info(f">>BUY {sym} @{sg.price:.2f} ({sg.reason})")
+                    if self.exec.open_position(
+                        sym, sg.price, sg.stop_loss, sg.take_profit
+                    ):
+                        self.trades += 1
+            self._ws()
+            if (datetime.now(timezone.utc) - self.lsnap).total_seconds() > SS:
+                self._snap()
+        except Exception as e:
+            logger.error(f"_ok {msg.get('k', {}).get('s', '?')}: {e}")
 
     def mc(self, sym):
         s = get_session()
