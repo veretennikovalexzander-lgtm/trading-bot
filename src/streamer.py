@@ -76,11 +76,11 @@ class WebSocketStreamer:
         cfg = get_config()
         streams = "/".join(f"{s.lower()}@kline_{INTERVAL}" for s in cfg.bot.symbols)
         base_url = (
-            "wss://testnet.binance.vision/stream"
+            "wss://testnet.binance.vision/ws"
             if cfg.binance.testnet
-            else "wss://stream.binance.com:9443/stream"
+            else "wss://ws.binance.com:9443/ws"
         )
-        ws_url = f"{base_url}?streams={streams}"
+        ws_url = f"{base_url}/{streams}"
 
         backoff = RECONNECT_DELAY
 
