@@ -88,7 +88,6 @@ class WebSocketStreamer:
                     backoff = RECONNECT_DELAY
                     async for raw in ws:
                         if not self.controller.running:
-                        if self._msg_count == 1: logger.info("DEBUG: first message received")
                             break
                         self._msg_count += 1
                         try:
@@ -98,7 +97,6 @@ class WebSocketStreamer:
             except Exception as e:
                 logger.error(f"WebSocket error: {e}")
             if not self.controller.running:
-                        if self._msg_count == 1: logger.info("DEBUG: first message received")
                 break
             logger.warning(f"Reconnecting in {backoff}s...")
             await asyncio.sleep(backoff)
@@ -125,8 +123,6 @@ class WebSocketStreamer:
         self.controller.last_close_times[symbol] = close_time
 
         # Debug: first few closed candles
-        if self._msg_count <= 120:
-            logger.info(f"Candle: {symbol} close={kline.get('c')} closed=True")
 
         self._process_candle(symbol, kline)
 
