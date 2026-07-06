@@ -81,6 +81,7 @@ class WebSocketStreamer:
             else "wss://ws.binance.com:9443/ws"
         )
         ws_url = f"{base_url}/{streams}"
+        logger.info(f"WebSocket URL: {ws_url}")
 
         backoff = RECONNECT_DELAY
 
@@ -111,12 +112,18 @@ class WebSocketStreamer:
             backoff = min(backoff * 2, MAX_RECONNECT_DELAY)
 
     async def _handle_message(self, raw: str):
+        if not hasattr(self, "_msg_count"): self._msg_count = 0
+        self._msg_count += 1
+        if self._msg_count % 30 == 0:
+            from loguru import logger
+            logger.debug(f"WebSocket messages received: {self._msg_count}")
         msg = json.loads(raw)
         if "data" in msg:
             kline = msg["data"].get("k", {})
         else:
             kline = msg.get("k", {})
         if not kline or not kline.get("x", False):  # Only closed candles
+        if self._msg_count % 60 == 0: logger.debug(f"Non-closed kline: {kline.get("s","?")}")
             return
 
         symbol = kline.get("s", "")
