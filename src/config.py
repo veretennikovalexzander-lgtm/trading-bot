@@ -78,9 +78,9 @@ class BotConfig:
     )
     use_strict_rsi: bool = field(
         default_factory=lambda: _env_bool("BOT_STRICT_RSI", False)
+    )
     rsi_threshold: int = field(
         default_factory=lambda: _env_int("BOT_RSI_THRESHOLD", 40)
-    )
     )
 
     def override_from_db(self, db_configs: dict[str, str]):
