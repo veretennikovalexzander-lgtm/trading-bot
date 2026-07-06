@@ -1,15 +1,14 @@
-"""WebSocket market data streamer: receives klines in real-time."""
+"""WebSocket market data streamer — async version using websockets library."""
 
 from __future__ import annotations
 
+import asyncio
 import json
-import threading
-import time
 from datetime import datetime, timezone
 
 import pandas as pd
 from loguru import logger
-from src.binance_client import get_account_balance, get_client, ping
+from src.binance_client import get_account_balance, get_client
 from src.config import get_config
 from src.controller import BotController
 from src.database import get_session
@@ -17,10 +16,12 @@ from src.models import MarketData
 from src.models import Position as PositionModel
 
 INTERVAL = "1m"
-MAX_CANDLES = 100
 PRICE_CRASH_CANDLES = 60
 SNAP_INTERVAL_SEC = 6 * 3600
-MAX_RECONNECT_DELAY = 60  # Max seconds between reconnect attempts
+RECONNECT_DELAY = 3
+MAX_RECONNECT_DELAY = 120
+
+_ws_lock = asyncio.Lock()
 
 
 def _find_bb_columns(dataframe):
@@ -34,7 +35,7 @@ def _find_bb_columns(dataframe):
 
 
 class WebSocketStreamer:
-    """Streams klines via Binance WebSocket, processes candles in real-time."""
+    """Async WebSocket kline streamer with exponential reconnect backoff."""
 
     def __init__(self, controller: BotController, profit_manager, on_position_closed):
         self.controller = controller
@@ -42,13 +43,11 @@ class WebSocketStreamer:
         self._on_position_closed = on_position_closed
         self._last_status_log: dict[str, datetime] = {}
         self._last_snapshot = datetime.min.replace(tzinfo=timezone.utc)
-        self._twm = None
-        self._reconnect_count = 0
         for symbol in controller.strategies:
             self._last_status_log[symbol] = datetime.min.replace(tzinfo=timezone.utc)
 
     def load_history(self):
-        """Prime candle buffers with 50 historical candles."""
+        """Prime candle buffers with 50 historical candles (sync, called before async loop)."""
         client = get_client()
         for symbol in self.controller.candles:
             try:
@@ -72,67 +71,67 @@ class WebSocketStreamer:
             except Exception as e:
                 logger.error(f"Load candles {symbol}: {e}")
 
-    def run(self):
-        """Start WebSocket and process incoming klines."""
+    async def run(self):
+        """Async main loop: connect to Binance WebSocket with reconnect."""
         cfg = get_config()
+        streams = "/".join(f"{s.lower()}@kline_{INTERVAL}" for s in cfg.bot.symbols)
+        base_url = (
+            "wss://testnet.binance.vision/stream"
+            if cfg.binance.testnet
+            else "wss://stream.binance.com:9443/stream"
+        )
+        ws_url = f"{base_url}?streams={streams}"
+
+        backoff = RECONNECT_DELAY
+
         while self.controller.running:
             try:
-                from binance import ThreadedWebsocketManager
+                import websockets
 
-                self._twm = ThreadedWebsocketManager(
-                    api_key=cfg.binance.api_key,
-                    api_secret=cfg.binance.api_secret,
-                    testnet=cfg.binance.testnet,
-                )
-                self._twm.start()
-                streams = [f"{s.lower()}@kline_{INTERVAL}" for s in cfg.bot.symbols]
-                self._twm.start_multiplex_socket(
-                    callback=self._on_message, streams=streams
-                )
-                logger.info(f"WebSocket connected: {cfg.bot.symbols}")
-                self._reconnect_count = 0
-                self._twm.join()
+                async with websockets.connect(
+                    ws_url, ping_interval=20, ping_timeout=10
+                ) as ws:
+                    logger.info(f"WebSocket connected ({len(cfg.bot.symbols)} streams)")
+                    backoff = RECONNECT_DELAY
+                    async for raw in ws:
+                        if not self.controller.running:
+                            break
+                        try:
+                            await self._handle_message(raw)
+                        except Exception as e:
+                            logger.error(f"Message handler error: {e}")
             except Exception as e:
                 logger.error(f"WebSocket error: {e}")
 
             if not self.controller.running:
                 break
 
-            # Reconnect with exponential backoff
-            self._reconnect_count += 1
-            delay = min(2**self._reconnect_count, MAX_RECONNECT_DELAY)
-            logger.warning(
-                f"WebSocket reconnecting in {delay}s (attempt {self._reconnect_count})"
-            )
-            time.sleep(delay)
+            logger.warning(f"Reconnecting in {backoff}s...")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, MAX_RECONNECT_DELAY)
 
-    def _on_message(self, msg: dict):
-        """Handle incoming WebSocket message."""
-        if not self.controller.running:
-            return
-
+    async def _handle_message(self, raw: str):
+        """Parse WebSocket message and dispatch to sync processing."""
+        msg = json.loads(raw)
         data = msg.get("data", {})
         kline = data.get("k", {})
-        if not kline:
-            return
-
-        # Only process closed candles
-        if not kline.get("x", False):
+        if not kline or not kline.get("x", False):  # Only closed candles
             return
 
         symbol = kline.get("s", "")
         if symbol not in self.controller.strategies:
             return
 
-        close_time = kline.get("T", 0) // 1000  # ms -> seconds
+        close_time = kline.get("T", 0) // 1000
         if close_time <= self.controller.last_close_times.get(symbol, 0):
             return
         self.controller.last_close_times[symbol] = close_time
 
-        self._process_candle(symbol, kline)
+        # Process candle in thread pool (pandas/DB are blocking)
+        await asyncio.to_thread(self._process_candle, symbol, kline)
 
     def _process_candle(self, symbol: str, kline: dict):
-        """Process a closed candle: update buffer, analyse, trade."""
+        """Sync processing: update buffer, indicators, trade logic."""
         candle = {
             "open": float(kline["o"]),
             "high": float(kline["h"]),
@@ -145,13 +144,12 @@ class WebSocketStreamer:
             buf[-1] = candle
         else:
             buf.append(candle)
-
         if len(buf) < 25:
             return
 
         close_price = candle["close"]
 
-        # Verbose status (every 60s per symbol)
+        # Status log (every 60s per symbol)
         now = datetime.now(timezone.utc)
         if (
             now
@@ -162,7 +160,7 @@ class WebSocketStreamer:
             self._last_status_log[symbol] = now
             self._log_market_status(symbol, buf, close_price)
 
-        # Save to DB
+        # Save candle
         self._save_candle(symbol, kline, candle)
 
         # Breaker checks
@@ -180,12 +178,10 @@ class WebSocketStreamer:
             ctrl.risk_manager.check_price_decline_orange(
                 symbol, close_price, price_1h_ago
             )
-
         if ctrl.risk_manager.breaker_level.value == "RED":
-            logger.critical("RED BREAKER — stopping bot")
+            logger.critical("RED BREAKER — stopping")
             self.controller.running = False
             return
-
         if not ctrl.risk_manager.is_trading_allowed()[0]:
             return
 
@@ -196,7 +192,6 @@ class WebSocketStreamer:
             .filter(PositionModel.symbol == symbol, PositionModel.status == "OPEN")
             .first()
         )
-
         if position:
             asset = symbol.replace("USDT", "")
             balance = get_account_balance(asset)
@@ -248,46 +243,43 @@ class WebSocketStreamer:
             import pandas_ta as ta
 
             df = pd.DataFrame(list(buf))
-            close_series = df["close"]
-            bb = ta.bbands(close_series, length=20, std=2)
-            rsi_series = ta.rsi(close_series, length=14)
-            lower_col, mid_col = (
-                _find_bb_columns(bb) if bb is not None else (None, None)
-            )
-            lower = float(bb.iloc[-1][lower_col]) if lower_col else 0
-            mid = float(bb.iloc[-1][mid_col]) if mid_col else 0
-            rsi_val = (
+            bb = ta.bbands(df["close"], length=20, std=2)
+            rsi_series = ta.rsi(df["close"], length=14)
+            lc, mc = _find_bb_columns(bb) if bb is not None else (None, None)
+            lo = float(bb.iloc[-1][lc]) if lc else 0
+            mi = float(bb.iloc[-1][mc]) if mc else 0
+            rv = (
                 float(rsi_series.iloc[-1])
                 if rsi_series is not None and not pd.isna(rsi_series.iloc[-1])
                 else 0
             )
-            sig = "BUY" if lower and close_price <= lower and rsi_val < 40 else "HOLD"
-            pos_str = ""
+            sig = "BUY" if lo and close_price <= lo and rv < 40 else "HOLD"
+            ps = ""
             session = get_session()
-            pos = (
+            p = (
                 session.query(PositionModel)
                 .filter(PositionModel.symbol == symbol, PositionModel.status == "OPEN")
                 .first()
             )
-            if pos:
-                pos_str = f" | POS: ent={float(pos.entry_price):.2f} SL={float(pos.stop_loss or 0):.2f} TP={float(pos.take_profit or 0):.2f}"
+            if p:
+                ps = f" | POS: ent={float(p.entry_price):.2f} SL={float(p.stop_loss or 0):.2f} TP={float(p.take_profit or 0):.2f}"
             session.close()
             logger.info(
-                f"[{symbol}] {close_price:.2f} | BB:{lower:.2f}/{mid:.2f} | RSI:{rsi_val:.1f} | {sig}{pos_str}"
+                f"[{symbol}] {close_price:.2f} | BB:{lo:.2f}/{mi:.2f} | RSI:{rv:.1f} | {sig}{ps}"
             )
         except Exception as e:
-            logger.info(f"[{symbol}] {close_price:.2f} | indicators error: {e}")
+            logger.info(f"[{symbol}] {close_price:.2f} | ind err: {e}")
 
     def _save_candle(self, symbol: str, kline: dict, candle: dict):
         try:
             session = get_session()
-            open_time = datetime.fromtimestamp(kline["t"] / 1000, tz=timezone.utc)
+            ot = datetime.fromtimestamp(kline["t"] / 1000, tz=timezone.utc)
             if (
                 not session.query(MarketData)
                 .filter(
                     MarketData.symbol == symbol,
                     MarketData.interval == INTERVAL,
-                    MarketData.open_time == open_time,
+                    MarketData.open_time == ot,
                 )
                 .first()
             ):
@@ -295,7 +287,7 @@ class WebSocketStreamer:
                     MarketData(
                         symbol=symbol,
                         interval=INTERVAL,
-                        open_time=open_time,
+                        open_time=ot,
                         close_time=datetime.fromtimestamp(
                             kline["T"] / 1000, tz=timezone.utc
                         ),
@@ -314,10 +306,10 @@ class WebSocketStreamer:
 
     def _take_snapshot(self):
         try:
-            balance = get_account_balance("USDT")
-            session = get_session()
             from src.models import AccountSnapshot
 
+            balance = get_account_balance("USDT")
+            session = get_session()
             session.add(
                 AccountSnapshot(
                     total_balance=balance,
