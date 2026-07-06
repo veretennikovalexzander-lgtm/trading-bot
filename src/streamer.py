@@ -76,7 +76,7 @@ class WebSocketStreamer:
         cfg = get_config()
         streams = "/".join(f"{s.lower()}@kline_{INTERVAL}" for s in cfg.bot.symbols)
         base_url = (
-            "wss://testnet.binance.vision/ws"
+            "wss://stream.binance.com:9443/ws"
             if cfg.binance.testnet
             else "wss://ws.binance.com:9443/ws"
         )
