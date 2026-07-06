@@ -111,10 +111,11 @@ class WebSocketStreamer:
             backoff = min(backoff * 2, MAX_RECONNECT_DELAY)
 
     async def _handle_message(self, raw: str):
-        """Parse WebSocket message and dispatch to sync processing."""
         msg = json.loads(raw)
-        data = msg.get("data", {})
-        kline = data.get("k", {})
+        if "data" in msg:
+            kline = msg["data"].get("k", {})
+        else:
+            kline = msg.get("k", {})
         if not kline or not kline.get("x", False):  # Only closed candles
             return
 
