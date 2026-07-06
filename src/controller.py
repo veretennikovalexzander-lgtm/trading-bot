@@ -31,7 +31,7 @@ class BotController:
         cfg = get_config()
         for symbol in cfg.bot.symbols:
             self.candles[symbol] = deque(maxlen=100)
-            self.strategies[symbol] = BollingerRSIStrategy(symbol=symbol, interval="1m")
+            self.strategies[symbol] = BollingerRSIStrategy(symbol=symbol, interval="1m", rsi_oversold=cfg.bot.rsi_threshold)
 
     def write_status(self, extra: dict | None = None):
         data = {
