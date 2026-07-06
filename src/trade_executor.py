@@ -63,7 +63,6 @@ class TradeExecutor:
             session.close()
             return False
 
-        # Get actual filled quantity and price
         fills = order.get("fills", [])
         if not fills:
             session.close()
@@ -74,7 +73,6 @@ class TradeExecutor:
         total_cost = sum(float(f["qty"]) * float(f["price"]) for f in fills)
         avg_price = total_cost / total_qty if total_qty > 0 else price
 
-        # Save order
         db_order = Order(
             order_id=str(order.get("orderId", "")),
             client_order_id=order.get("clientOrderId", ""),
@@ -90,7 +88,6 @@ class TradeExecutor:
         )
         session.add(db_order)
 
-        # Create position
         position = Position(
             symbol=symbol,
             side="LONG",
@@ -113,10 +110,23 @@ class TradeExecutor:
     def close_position(
         self, position: Position, exit_price: float, reason: str = "manual"
     ) -> bool:
-        """Close position using MARKET SELL for instant execution."""
+        """Close position using MARKET SELL. Checks balance first."""
         session = get_session()
-
         qty = float(position.quantity)
+
+        # Verify we actually have the asset
+        asset = position.symbol.replace("USDT", "")
+        actual_balance = bc.get_account_balance(asset)
+        if actual_balance < qty:
+            logger.error(
+                f"Insufficient {asset}: have {actual_balance:.6f}, need {qty:.6f} — marking as closed"
+            )
+            position.status = "CLOSED"
+            position.closed_at = datetime.now(timezone.utc)
+            session.commit()
+            session.close()
+            return False
+
         order = bc.place_market_sell(position.symbol, qty)
         if not order:
             session.close()
@@ -162,6 +172,13 @@ class TradeExecutor:
         positions = session.query(Position).filter(Position.status == "OPEN").all()
         closed = 0
         for pos in positions:
+            asset = pos.symbol.replace("USDT", "")
+            actual_balance = bc.get_account_balance(asset)
+            if actual_balance < float(pos.quantity):
+                pos.status = "CLOSED"
+                pos.closed_at = datetime.now(timezone.utc)
+                closed += 1
+                continue
             if bc.place_market_sell(pos.symbol, float(pos.quantity)):
                 pos.status = "CLOSED"
                 pos.closed_at = datetime.now(timezone.utc)
