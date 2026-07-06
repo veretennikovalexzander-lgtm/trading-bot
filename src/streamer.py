@@ -118,6 +118,7 @@ class WebSocketStreamer:
             from loguru import logger
             logger.debug(f"WebSocket messages received: {self._msg_count}")
         msg = json.loads(raw)
+        if self._msg_count == 1: logger.info(f"First WS message keys: {list(msg.keys())}")
         if "data" in msg:
             kline = msg["data"].get("k", {})
         else:
