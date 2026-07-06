@@ -199,11 +199,11 @@ class BCtrl:
                 for k in ks:
                     self.candles[s].append(
                         {
-                            "o": float(k[1]),
-                            "h": float(k[2]),
-                            "l": float(k[3]),
-                            "c": float(k[4]),
-                            "v": float(k[5]),
+                            "open": float(k[1]),
+                            "high": float(k[2]),
+                            "low": float(k[3]),
+                            "close": float(k[4]),
+                            "volume": float(k[5]),
                             "ot": k[0],
                             "ct": k[6],
                         }
@@ -230,11 +230,11 @@ class BCtrl:
                                     "t": k[0],
                                     "T": k[6],
                                     "s": s,
-                                    "o": k[1],
-                                    "h": k[2],
-                                    "l": k[3],
-                                    "c": k[4],
-                                    "v": k[5],
+                                    "open": k[1],
+                                    "high": k[2],
+                                    "low": k[3],
+                                    "close": k[4],
+                                    "volume": k[5],
                                     "n": k[8],
                                     "x": True,
                                 }
@@ -248,11 +248,11 @@ class BCtrl:
         k = msg["k"]
         sym = k["s"]
         c = {
-            "o": float(k["o"]),
-            "h": float(k["h"]),
-            "l": float(k["l"]),
-            "c": float(k["c"]),
-            "v": float(k["v"]),
+            "open": float(k["open"]),
+            "high": float(k["high"]),
+            "low": float(k["low"]),
+            "close": float(k["close"]),
+            "volume": float(k["volume"]),
         }
         buf = self.candles[sym]
         if buf and buf[-1].get("ot") == k["t"]:
@@ -269,7 +269,7 @@ class BCtrl:
             try:
                 import pandas_ta as ta
 
-                cs = df["c"]
+                cs = df["close"]
                 bb = ta.bbands(cs, length=20, std=2)
                 rs = ta.rsi(cs, length=14)
                 blc, bmc = _bb_cols(bb) if bb is not None else (None, None)
@@ -280,7 +280,7 @@ class BCtrl:
                     if rs is not None and not pd.isna(rs.iloc[-1])
                     else 0
                 )
-                sig = "BUY" if lo and c["c"] <= lo and rv < 35 else "HOLD"
+                sig = "BUY" if lo and c["close"] <= lo and rv < 35 else "HOLD"
                 ps = ""
                 s = get_session()
                 p = s.query(PM).filter(PM.symbol == sym, PM.status == "OPEN").first()
@@ -288,10 +288,10 @@ class BCtrl:
                     ps = f" | POS: ent={float(p.entry_price):.2f} SL={float(p.stop_loss or 0):.2f}"
                 s.close()
                 logger.info(
-                    f"[{sym}] {c['c']:.2f} | BB:{lo:.2f}/{mi:.2f} | RSI:{rv:.1f} | {sig}{ps}"
+                    f"[{sym}] {c['close']:.2f} | BB:{lo:.2f}/{mi:.2f} | RSI:{rv:.1f} | {sig}{ps}"
                 )
             except Exception as ex:
-                logger.info(f"[{sym}] {c['c']:.2f} | ind fail: {ex}")
+                logger.info(f"[{sym}] {c['close']:.2f} | ind fail: {ex}")
         # Save candle to DB
         try:
             s = get_session()
@@ -313,11 +313,11 @@ class BCtrl:
                         close_time=datetime.fromtimestamp(
                             k["T"] / 1000, tz=timezone.utc
                         ),
-                        open=c["o"],
-                        high=c["h"],
-                        low=c["l"],
-                        close=c["c"],
-                        volume=c["v"],
+                        open=c["open"],
+                        high=c["high"],
+                        low=c["low"],
+                        close=c["close"],
+                        volume=c["volume"],
                         trades_count=k.get("n", 0),
                     )
                 )
@@ -330,15 +330,15 @@ class BCtrl:
             self.risk.check_daily_drawdown(get_account_balance("USDT"))
         if len(buf) >= 15:
             df = pd.DataFrame(list(buf))
-            atr = (df["h"] - df["l"]).tail(14).mean()
-            if (atr / c["c"]) * 100 > 3.0:
-                self.risk.check_atr_volatility((atr / c["c"]) * 100)
+            atr = (df["high"] - df["low"]).tail(14).mean()
+            if (atr / c["close"]) * 100 > 3.0:
+                self.risk.check_atr_volatility((atr / c["close"]) * 100)
         if len(buf) >= PCC:
-            self.risk.check_price_crash(sym, c["c"], list(buf)[-PCC]["c"])
+            self.risk.check_price_crash(sym, c["close"], list(buf)[-PCC]["close"])
         if not self.risk.is_trading_allowed()[0]:
             return
         # Position management
-        pr = c["c"]
+        pr = c["close"]
         s = get_session()
         pos = s.query(PM).filter(PM.symbol == sym, PM.status == "OPEN").first()
         if pos:
