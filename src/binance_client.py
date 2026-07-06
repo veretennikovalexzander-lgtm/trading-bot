@@ -147,3 +147,20 @@ def get_order_status(symbol: str, order_id: str) -> dict | None:
     except Exception as e:
         logger.error(f"Failed to get order {order_id}: {e}")
     return None
+
+
+def transfer_to_funding(asset: str, amount: float) -> bool:
+    """Transfer asset from Spot to Funding wallet via Universal Transfer API."""
+    try:
+        result = get_client().make_universal_transfer(
+            from_account_type="SPOT",
+            to_account_type="FUNDING",
+            asset=asset,
+            amount=amount,
+        )
+        txn_id = result.get("tranId", "?")
+        logger.info(f"TRANSFER: {amount:.8f} {asset} Spot → Funding (id={txn_id})")
+        return True
+    except Exception as e:
+        logger.error(f"TRANSFER failed {asset}: {e}")
+        return False
