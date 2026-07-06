@@ -16,7 +16,7 @@ from pathlib import Path
 import pandas as pd
 from loguru import logger
 from src.binance_client import get_account_balance, get_client, get_current_price, ping
-from src.config import get_config, reload_from_db
+from src.config import get_config
 from src.database import get_session, init_db
 from src.logger import setup_logging
 from src.models import AccountSnapshot, BotLog, MarketData
@@ -87,19 +87,14 @@ class BCtrl:
         cfg = get_config()
         for s in cfg.bot.symbols:
             self.candles[s] = deque(maxlen=MAX_CANDLES)
-            self.strategies[s] = BollingerRSIStrategy(
-                symbol=s,
-                interval=INTERVAL,
-                use_strict_filter=cfg.bot.use_strict_rsi,
-                debug=True,
-            )
+            self.strategies[s] = BollingerRSIStrategy(symbol=s, interval=INTERVAL)
         self._load_profit()
 
     def _load_profit(self):
         if PROFIT_BTC_FILE.exists():
             try:
                 self.pbtc = json.loads(PROFIT_BTC_FILE.read_text()).get("total_btc", 0.0)
-            except:
+            except Exception:
                 pass
 
     def _save_profit(self):
@@ -113,7 +108,7 @@ class BCtrl:
             )
         )
 
-    def _fix_profit(self, p, symbol=""):
+    def _fix_profit(self, p):
         bp = get_current_price("BTCUSDT")
         if bp <= 0:
             return
@@ -170,9 +165,7 @@ class BCtrl:
                         symbol=sym,
                         interval=INTERVAL,
                         open_time=ot,
-                        close_time=datetime.fromtimestamp(
-                            k["T"] / 1000, tz=timezone.utc
-                        ),
+                        close_time=datetime.fromtimestamp(k["T"] / 1000, tz=timezone.utc),
                         open=c["open"],
                         high=c["high"],
                         low=c["low"],
@@ -191,12 +184,11 @@ class BCtrl:
             json.dumps(
                 {
                     "running": self.running,
-                    "started_at": self.started_at.isoformat()
-                    if self.started_at
-                    else None,
+                    "started_at": self.started_at.isoformat() if self.started_at else None,
                     "network_ok": ping(),
                     "trades": self.trades,
-                    "profit_btc": round(self.pbtc, 8), "profit_usdt": round(self.pusdt, 4),
+                    "profit_btc": round(self.pbtc, 8),
+                    "profit_usdt": round(self.pusdt, 4),
                     **(self.risk.get_daily_stats()),
                 },
                 indent=2,
@@ -233,7 +225,11 @@ class BCtrl:
         for sym in self.candles:
             try:
                 kls = cl.get_klines(symbol=sym, interval=INTERVAL, limit=50)
-            logger.info(f"Poll {sym}: got {len(kls)} klines, last_ct={self._last_close_times.get(sym,0)} newest_ct={kls[-1][6] if kls else 0}")
+                logger.info(
+                    f"Poll {sym}: got {len(kls)} klines, "
+                    f"last_ct={self._last_close_times.get(sym, 0)} "
+                    f"newest_ct={kls[-1][6] if kls else 0}"
+                )
                 for k in kls:
                     self.candles[sym].append(
                         {
@@ -257,7 +253,11 @@ class BCtrl:
             try:
                 for sym in self.candles:
                     kls = cl.get_klines(symbol=sym, interval=INTERVAL, limit=3)
-            logger.info(f"Poll {sym}: got {len(kls)} klines, last_ct={self._last_close_times.get(sym,0)} newest_ct={kls[-1][6] if kls else 0}")
+                    logger.info(
+                        f"Poll {sym}: got {len(kls)} klines, "
+                        f"last_ct={self._last_close_times.get(sym, 0)} "
+                        f"newest_ct={kls[-1][6] if kls else 0}"
+                    )
                     for k in kls:
                         ct = k[6]
                         if ct <= self._last_close_times.get(sym, 0):
@@ -280,7 +280,6 @@ class BCtrl:
                         self._on_kline(msg)
             except Exception as e:
                 logger.error(f"Poll error: {e}")
-            logger.info("Poll tick: checking for new candles")
             time.sleep(POLL_SEC)
 
     def _on_kline(self, msg):
@@ -303,20 +302,16 @@ class BCtrl:
         if len(buf) < 25:
             return
 
-        cfg = get_config()
-        # Drawdown
+        # Drawdown check
         if self.risk.day_start_balance > 0:
             self.risk.check_daily_drawdown(get_account_balance("USDT"))
-        # Config reload
-        if (datetime.now(timezone.utc) - self.last_cfg).total_seconds() > CFG_RELOAD_S:
-            reload_from_db()
-            self.last_cfg = datetime.now(timezone.utc)
-        # Breaker
+        # Breaker: ATR
         if len(buf) >= 15:
             df = pd.DataFrame(list(buf))
             atr = (df["high"] - df["low"]).tail(14).mean()
             if (atr / c["close"]) * 100 > 3.0:
                 self.risk.check_atr_volatility((atr / c["close"]) * 100)
+        # Breaker: price crash
         if len(buf) >= PRICE_CRASH_CANDLES:
             self.risk.check_price_crash(
                 sym, c["close"], list(buf)[-PRICE_CRASH_CANDLES]["close"]
@@ -340,8 +335,8 @@ class BCtrl:
                 self.trades += 1
                 logger.info(f"TP {sym} @ {price:.2f} PnL={pnl:.2f}")
                 if pnl > 0:
-                    self._fix_profit(pnl, symbol)
-                    return
+                    self._fix_profit(pnl)
+                return
             if pos.stop_loss and price <= float(pos.stop_loss):
                 pnl = float(pos.unrealized_pnl)
                 s.close()
@@ -350,8 +345,8 @@ class BCtrl:
                 self.trades += 1
                 logger.info(f"SL {sym} @ {price:.2f} PnL={pnl:.2f}")
                 if pnl > 0:
-                    self._fix_profit(pnl, symbol)
-                    return
+                    self._fix_profit(pnl)
+                return
             s.close()
         else:
             s.close()
@@ -359,11 +354,10 @@ class BCtrl:
             sig = self.strategies[sym].analyze(df)
             if sig.signal.value == "BUY":
                 logger.info(
-                    f"Signal BUY {sym} @ {sig.price:.2f} ({sig.reason}) SL={sig.stop_loss:.2f} TP={sig.take_profit:.2f}"
+                    f"Signal BUY {sym} @ {sig.price:.2f} ({sig.reason}) "
+                    f"SL={sig.stop_loss:.2f} TP={sig.take_profit:.2f}"
                 )
-                if self.exec.open_position(
-                    sym, sig.price, sig.stop_loss, sig.take_profit
-                ):
+                if self.exec.open_position(sym, sig.price, sig.stop_loss, sig.take_profit):
                     self.trades += 1
         self._wstatus()
         if (datetime.now(timezone.utc) - self.last_snap).total_seconds() > SNAP_S:
@@ -386,25 +380,27 @@ class BCtrl:
         s.close()
         run = False
         pbtc = 0.0
+        pusdt = 0.0
         if STATUS_FILE.exists():
             try:
                 j = json.loads(STATUS_FILE.read_text())
                 run = j.get("running", False)
                 pbtc = j.get("profit_btc", 0.0)
                 pusdt = j.get("profit_usdt", 0.0)
-            except:
+            except Exception:
                 pass
         bal = get_account_balance("USDT")
         print(f"\n{'=' * 45}\n  Bot Status ({INTERVAL})\n{'=' * 45}")
         print(f"  Running: {run} | Network: {'OK' if ping() else 'FAIL'}")
-        print(f"  Balance: {bal:.2f} USDT | BTC: {pbtc:.8f} | USDT: {pusdt:.2f}")
+        print(f"  Balance: {bal:.2f} USDT | Profit: {pbtc:.8f} BTC")
         print(f"  Trades: {d['trades']} | PnL: {d['pnl']} USDT")
         print(f"  Loss streak: {d['consecutive_losses']} | Breaker: {d['breaker']}")
         if pos:
             print(f"\n  Positions ({len(pos)}):")
             for p in pos:
                 print(
-                    f"    {p.symbol} entry={float(p.entry_price):.2f} qty={float(p.quantity):.6f} SL={float(p.stop_loss or 0):.2f}"
+                    f"    {p.symbol} entry={float(p.entry_price):.2f} "
+                    f"qty={float(p.quantity):.6f} SL={float(p.stop_loss or 0):.2f}"
                 )
         else:
             print("\n  Positions: 0")
