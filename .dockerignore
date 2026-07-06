@@ -1,0 +1,13 @@
+.venv
+__pycache__
+*.pyc
+.git
+CREDENTIALS.md
+*.log
+logs/
+bot_status.json
+profit_state.json
+profit_btc.json
+profit_usdt.json
+paper_account.json
+risk_state.json

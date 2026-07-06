@@ -200,3 +200,25 @@ def place_oco_sell(symbol: str, quantity: float, take_profit_price: float, stop_
         except Exception as e2:
             logger.error(f"Stop-loss failed for {symbol}: {e2}")
             return None
+
+# --- Rate limiter (FR: protection from Binance bans) ---
+import time as _time
+from collections import defaultdict
+
+_request_timestamps: dict[str, list[float]] = defaultdict(list)
+_MAX_REQUESTS_PER_MINUTE = 1100  # Binance limit: 1200, keep 100 for safety
+_RATE_LIMIT_WINDOW = 60.0  # seconds
+
+
+def _rate_limit(endpoint: str = "default"):
+    """Simple sliding-window rate limiter. Blocks if > MAX_REQUESTS_PER_MINUTE."""
+    now = _time.time()
+    window = _request_timestamps[endpoint]
+    # Remove old entries
+    window[:] = [t for t in window if now - t < _RATE_LIMIT_WINDOW]
+    if len(window) >= _MAX_REQUESTS_PER_MINUTE:
+        sleep_time = _RATE_LIMIT_WINDOW - (now - window[0]) + 0.1
+        from loguru import logger
+        logger.warning(f"Rate limit approaching — sleeping {sleep_time:.1f}s")
+        _time.sleep(max(0, sleep_time))
+    window.append(_time.time())

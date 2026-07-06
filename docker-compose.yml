@@ -1,0 +1,46 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: trading-bot-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-trading_bot}
+      POSTGRES_USER: ${POSTGRES_USER:-bot_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bot_user} -d ${POSTGRES_DB:-trading_bot}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  bot:
+    build: .
+    container_name: trading-bot-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-trading_bot}
+      POSTGRES_USER: ${POSTGRES_USER:-bot_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      BINANCE_API_KEY: ${BINANCE_API_KEY}
+      BINANCE_API_SECRET: ${BINANCE_API_SECRET}
+      BINANCE_TESTNET: ${BINANCE_TESTNET:-true}
+      BOT_SYMBOLS: ${BOT_SYMBOLS:-BTCUSDT,ETHUSDT}
+      BOT_TRADE_AMOUNT_PCT: ${BOT_TRADE_AMOUNT_PCT:-10}
+      BOT_RISK_PER_TRADE: ${BOT_RISK_PER_TRADE:-1}
+      BOT_PROFIT_TARGET: ${BOT_PROFIT_TARGET:-100}
+      BOT_MAX_TRADES_PER_DAY: ${BOT_MAX_TRADES_PER_DAY:-30}
+
+volumes:
+  postgres_data:
