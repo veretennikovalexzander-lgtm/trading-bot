@@ -139,6 +139,7 @@ class WebSocketStreamer:
         # Process candle in thread pool (pandas/DB are blocking)
         try:
             await asyncio.to_thread(self._process_candle, symbol, kline)
+            logger.info(f"Processing closed candle: {symbol} @ {kline.get("c")}")
         except Exception as ex:
             logger.error(f"Process candle {symbol}: {ex}")
 
