@@ -247,7 +247,7 @@ class WebSocketStreamer:
                 if rsi_series is not None and not pd.isna(rsi_series.iloc[-1])
                 else 0
             )
-            sig = "BUY" if lo and close_price <= lo and rv < get_config().bot.rsi_threshold else "HOLD"
+            sig = "BUY" if not p and lo and close_price <= lo and rv < get_config().bot.rsi_threshold else ("IN" if p else "HOLD")
             ps = ""
             session = get_session()
             p = (
@@ -256,6 +256,7 @@ class WebSocketStreamer:
                 .first()
             )
             if p:
+                sig = "POSITION"
                 ps = f" | POS: ent={float(p.entry_price):.2f} SL={float(p.stop_loss or 0):.2f} TP={float(p.take_profit or 0):.2f}"
             session.close()
             logger.info(
