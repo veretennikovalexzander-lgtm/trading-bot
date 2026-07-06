@@ -115,7 +115,6 @@ class WebSocketStreamer:
         if not hasattr(self, "_msg_count"): self._msg_count = 0
         self._msg_count += 1
         if self._msg_count % 30 == 0:
-            from loguru import logger
             logger.debug(f"WebSocket messages received: {self._msg_count}")
         msg = json.loads(raw)
         if self._msg_count == 1: logger.info(f"First WS message keys: {list(msg.keys())}")
