@@ -42,3 +42,7 @@ class BotController:
             **(self.risk_manager.get_daily_stats()),
         }
         STATUS_FILE.write_text(json.dumps(data, indent=2))
+
+    def stop(self):
+        """Signal the bot to stop gracefully."""
+        self.running = False
