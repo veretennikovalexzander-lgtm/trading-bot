@@ -43,6 +43,7 @@ class WebSocketStreamer:
         self._on_position_closed = on_position_closed
         self._last_status_log: dict[str, datetime] = {}
         self._last_snapshot = datetime.min.replace(tzinfo=timezone.utc)
+        self._msg_count = 0
         for symbol in controller.strategies:
             self._last_status_log[symbol] = datetime.min.replace(tzinfo=timezone.utc)
 
@@ -136,7 +137,10 @@ class WebSocketStreamer:
         self.controller.last_close_times[symbol] = close_time
 
         # Process candle in thread pool (pandas/DB are blocking)
-        await asyncio.to_thread(self._process_candle, symbol, kline)
+        try:
+            await asyncio.to_thread(self._process_candle, symbol, kline)
+        except Exception as ex:
+            logger.error(f"Process candle {symbol}: {ex}")
 
     def _process_candle(self, symbol: str, kline: dict):
         """Sync processing: update buffer, indicators, trade logic."""
