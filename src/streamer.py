@@ -21,8 +21,6 @@ SNAP_INTERVAL_SEC = 6 * 3600
 RECONNECT_DELAY = 3
 MAX_RECONNECT_DELAY = 120
 
-_ws_lock = asyncio.Lock()
-
 
 def _find_bb_columns(dataframe):
     lower_col = mid_col = None
@@ -48,7 +46,6 @@ class WebSocketStreamer:
             self._last_status_log[symbol] = datetime.min.replace(tzinfo=timezone.utc)
 
     def load_history(self):
-        """Prime candle buffers with 50 historical candles (sync, called before async loop)."""
         client = get_client()
         for symbol in self.controller.candles:
             try:
@@ -73,19 +70,13 @@ class WebSocketStreamer:
                 logger.error(f"Load candles {symbol}: {e}")
 
     async def run(self):
-        """Async main loop: connect to Binance WebSocket with reconnect."""
         cfg = get_config()
         streams = "/".join(f"{s.lower()}@kline_{INTERVAL}" for s in cfg.bot.symbols)
-        base_url = (
-            "wss://stream.binance.com:9443/ws"
-            if cfg.binance.testnet
-            else "wss://ws.binance.com:9443/ws"
-        )
+        base_url = "wss://stream.binance.com:9443/ws"
         ws_url = f"{base_url}/{streams}"
         logger.info(f"WebSocket URL: {ws_url}")
 
         backoff = RECONNECT_DELAY
-
         while self.controller.running:
             try:
                 import websockets
@@ -98,34 +89,29 @@ class WebSocketStreamer:
                     async for raw in ws:
                         if not self.controller.running:
                             break
+                        self._msg_count += 1
                         try:
-                            await self._handle_message(raw)
+                            self._handle_message(raw)
                         except Exception as e:
-                            logger.error(f"Message handler error: {e}")
+                            logger.error(f"Message error: {e}")
             except Exception as e:
                 logger.error(f"WebSocket error: {e}")
-
             if not self.controller.running:
                 break
-
             logger.warning(f"Reconnecting in {backoff}s...")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, MAX_RECONNECT_DELAY)
 
-    async def _handle_message(self, raw: str):
-        if not hasattr(self, "_msg_count"): self._msg_count = 0
-        self._msg_count += 1
-        if self._msg_count % 30 == 0:
-            logger.debug(f"WebSocket messages received: {self._msg_count}")
+    def _handle_message(self, raw: str):
         msg = json.loads(raw)
-        if self._msg_count == 1: logger.info(f"First WS message keys: {list(msg.keys())}")
+        # Support both raw and multiplex formats
         if "data" in msg:
             kline = msg["data"].get("k", {})
         else:
             kline = msg.get("k", {})
-        if not kline or not kline.get("x", False):  # Only closed candles
-            if self._msg_count % 60 == 0: logger.debug(f"Non-closed kline")
-            return
+
+        if not kline or not kline.get("x", False):
+            return  # Not a closed candle
 
         symbol = kline.get("s", "")
         if symbol not in self.controller.strategies:
@@ -136,15 +122,13 @@ class WebSocketStreamer:
             return
         self.controller.last_close_times[symbol] = close_time
 
-        # Process candle in thread pool (pandas/DB are blocking)
-        try:
-            await asyncio.to_thread(self._process_candle, symbol, kline)
-            logger.info(f"Processing closed candle: {symbol} @ {kline.get("c")}")
-        except Exception as ex:
-            logger.error(f"Process candle {symbol}: {ex}")
+        # Debug: first few closed candles
+        if self._msg_count <= 120:
+            logger.info(f"Candle: {symbol} close={kline.get('c')} closed=True")
+
+        self._process_candle(symbol, kline)
 
     def _process_candle(self, symbol: str, kline: dict):
-        """Sync processing: update buffer, indicators, trade logic."""
         candle = {
             "open": float(kline["o"]),
             "high": float(kline["h"]),
@@ -162,7 +146,7 @@ class WebSocketStreamer:
 
         close_price = candle["close"]
 
-        # Status log (every 60s per symbol)
+        # Status log every 60s per symbol
         now = datetime.now(timezone.utc)
         if (
             now
@@ -173,7 +157,6 @@ class WebSocketStreamer:
             self._last_status_log[symbol] = now
             self._log_market_status(symbol, buf, close_price)
 
-        # Save candle
         self._save_candle(symbol, kline, candle)
 
         # Breaker checks
@@ -281,7 +264,7 @@ class WebSocketStreamer:
                 f"[{symbol}] {close_price:.2f} | BB:{lo:.2f}/{mi:.2f} | RSI:{rv:.1f} | {sig}{ps}"
             )
         except Exception as e:
-            logger.info(f"[{symbol}] {close_price:.2f} | ind err: {e}")
+            logger.error(f"[{symbol}] indicators error: {e}")
 
     def _save_candle(self, symbol: str, kline: dict, candle: dict):
         try:
