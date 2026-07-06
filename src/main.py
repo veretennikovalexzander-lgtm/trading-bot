@@ -1,4 +1,4 @@
-"""Trading Bot — async entry point. Usage: python -m src.main [start|status|close|logs]"""
+"""Trading Bot — async entry point. Usage: python -m src.main [start|status|monitor|close|logs]"""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 
 from loguru import logger
 from src.binance_client import get_account_balance, ping
-from src.cli import close_position, show_logs, show_status
+from src.cli import close_position, show_logs, show_monitor, show_status
 from src.config import get_config
 from src.controller import BotController
 from src.database import init_db
@@ -30,7 +30,6 @@ def _validate_config():
 
 
 async def _snapshot_loop(streamer: WebSocketStreamer):
-    """Background task: periodic snapshots."""
     while streamer.controller.running:
         await asyncio.sleep(6 * 3600)
         if streamer.controller.running:
@@ -68,7 +67,6 @@ async def run_bot_async():
     logger.info("=== Bot STARTED (async WebSocket) ===")
 
     try:
-        # Run WebSocket + background snapshot task concurrently
         async with asyncio.TaskGroup() as tg:
             tg.create_task(streamer.run())
             tg.create_task(_snapshot_loop(streamer))
@@ -87,7 +85,6 @@ async def run_bot_async():
 
 
 def run_bot():
-    """Sync wrapper for CLI compatibility."""
     asyncio.run(run_bot_async())
 
 
@@ -95,6 +92,9 @@ def main():
     cmd = sys.argv[1].lower() if len(sys.argv) >= 2 else ""
     if cmd == "status":
         show_status()
+    elif cmd == "monitor":
+        sec = int(sys.argv[2]) if len(sys.argv) >= 3 else 10
+        show_monitor(sec)
     elif cmd == "close" and len(sys.argv) >= 3:
         close_position(sys.argv[2].upper())
     elif cmd == "logs":
@@ -104,7 +104,7 @@ def main():
     elif cmd == "stop":
         print("Stop is handled by Ctrl+C")
     else:
-        print("Usage: python -m src.main [start|status|close SYMBOL|logs N]")
+        print("Commands: start | stop | status | monitor | close SYMBOL | logs N")
 
 
 if __name__ == "__main__":

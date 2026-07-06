@@ -1,8 +1,9 @@
-"""CLI commands: status, close, logs (independent of running controller)."""
+"""CLI commands: status, close, logs, monitor (independent of running controller)."""
 
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 from src.binance_client import get_account_balance, get_current_price, ping
@@ -57,6 +58,19 @@ def show_status():
     else:
         print("\n  Positions: 0")
     print(f"{'=' * 50}\n")
+
+
+def show_monitor(refresh_sec: int = 10):
+    """Live-updating status display. Ctrl+C to exit."""
+    print("Live monitor — Ctrl+C to exit\n")
+    try:
+        while True:
+            # Clear screen
+            print("\033[2J\033[H", end="")
+            show_status()
+            time.sleep(refresh_sec)
+    except KeyboardInterrupt:
+        print("Monitor stopped.")
 
 
 def close_position(symbol: str):
