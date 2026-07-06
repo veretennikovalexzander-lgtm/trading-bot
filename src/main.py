@@ -1,4 +1,4 @@
-"""Trading Bot — REST 1m, verbose. Profit: BTC→BTC, ETH→USDT (Funding)."""
+"""Trading Bot — REST 1m. OCO SL/TP on exchange. Profit: BTC→BTC, ETH→USDT."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ PS = 15
 PING_S = 30
 MPF = 3
 MC = 100
-PCC = 60
+PCC = 12
 SS = 21600
 SF = Path(__file__).resolve().parents[1] / "bot_status.json"
 PF = Path(__file__).resolve().parents[1] / "profit_state.json"
@@ -84,7 +84,7 @@ class BCtrl:
         self.candles: dict[str, deque] = {}
         self.strategies: dict[str, BollingerRSIStrategy] = {}
         self.lsnap = datetime.min.replace(tzinfo=timezone.utc)
-        self.lstatus: dict[str, datetime] = {}  # Per-symbol status log timer
+        self.lstatus: dict[str, datetime] = {}
         self.lct: dict[str, int] = {}
         for s in get_config().bot.symbols:
             self.candles[s] = deque(maxlen=MC)
@@ -293,14 +293,14 @@ class BCtrl:
                         .first()
                     )
                     if p:
-                        ps = f" | POS: ent={float(p.entry_price):.2f} SL={float(p.stop_loss or 0):.2f}"
+                        ps = f" | POS: ent={float(p.entry_price):.2f} SL={float(p.stop_loss or 0):.2f} TP={float(p.take_profit or 0):.2f}"
                     s.close()
                     logger.info(
                         f"[{sym}] {c['close']:.2f} | BB:{lo:.2f}/{mi:.2f} | RSI:{rv:.1f} | {sig}{ps}"
                     )
                 except Exception as ex:
                     logger.info(f"[{sym}] {c['close']:.2f} | ind fail: {ex}")
-            # Save candle to DB
+            # Save to DB
             try:
                 s = get_session()
                 ot = datetime.fromtimestamp(k["t"] / 1000, tz=timezone.utc)
@@ -333,7 +333,7 @@ class BCtrl:
                 s.close()
             except Exception:
                 pass
-            # Risk checks
+            # --- Circuit Breaker with new thresholds ---
             if self.risk.day_start_balance > 0:
                 self.risk.check_daily_drawdown(get_account_balance("USDT"))
             if len(buf) >= 15:
@@ -341,42 +341,56 @@ class BCtrl:
                 atr = (df["high"] - df["low"]).tail(14).mean()
                 if (atr / c["close"]) * 100 > 3.0:
                     self.risk.check_atr_volatility((atr / c["close"]) * 100)
-            if len(buf) >= PCC:
-                self.risk.check_price_crash(sym, c["close"], list(buf)[-PCC]["close"])
+            # -5% in 1h → FULL STOP (RED)
+            if len(buf) >= 60:
+                self.risk.check_price_crash_red(
+                    sym, c["close"], list(buf)[-60]["close"]
+                )
+            # -2.5% in 1h → pause 60min (ORANGE)
+            if len(buf) >= 60:
+                self.risk.check_price_decline_orange(
+                    sym, c["close"], list(buf)[-60]["close"]
+                )
+            # If RED breaker: stop bot completely
+            if self.risk.breaker_level.value == "RED":
+                logger.critical("RED BREAKER — full stop")
+                self.stop()
             if not self.risk.is_trading_allowed()[0]:
                 return
-            # Position management
-            pr = c["close"]
+            # --- Sync positions: check if OCO closed position ---
             s = get_session()
             pos = s.query(PM).filter(PM.symbol == sym, PM.status == "OPEN").first()
             if pos:
-                q = float(pos.quantity)
-                pos.current_price = pr
-                pos.unrealized_pnl = (pr - float(pos.entry_price)) * q
-                s.commit()
-                if pos.take_profit and pr >= float(pos.take_profit):
-                    pnl = float(pos.unrealized_pnl)
-                    s.close()
-                    self.exec.close_position(pos, pr, "tp")
+                # Check if OCO already sold (balance = 0)
+                asset = sym.replace("USDT", "")
+                bal = get_account_balance(asset)
+                if bal < float(pos.quantity) * 0.5 and float(pos.quantity) > 0:
+                    # OCO executed! Close in DB
+                    pr = c["close"]
+                    q = float(pos.quantity)
+                    pnl = (pr - float(pos.entry_price)) * q
+                    pos.current_price = pr
+                    pos.realized_pnl = pnl
+                    pos.status = "CLOSED"
+                    pos.closed_at = datetime.now(timezone.utc)
+                    s.commit()
                     self.risk.record_trade(pnl)
                     self.trades += 1
-                    logger.info(f"TP {sym} @{pr:.2f} PnL={pnl:.2f}")
-                    if pnl > 0:
-                        self._fp(pnl, sym)
-                        return
-                if pos.stop_loss and pr <= float(pos.stop_loss):
-                    pnl = float(pos.unrealized_pnl)
+                    logger.info(f"OCO closed {sym} @{pr:.2f} PnL={pnl:.2f}")
                     s.close()
-                    self.exec.close_position(pos, pr, "sl")
-                    self.risk.record_trade(pnl)
-                    self.trades += 1
-                    logger.info(f"SL {sym} @{pr:.2f} PnL={pnl:.2f}")
                     if pnl > 0:
                         self._fp(pnl, sym)
-                        return
-                s.close()
+                else:
+                    # Update unrealized PnL
+                    pos.current_price = c["close"]
+                    pos.unrealized_pnl = (c["close"] - float(pos.entry_price)) * float(
+                        pos.quantity
+                    )
+                    s.commit()
+                    s.close()
             else:
                 s.close()
+                # No position — check entry signal
                 df = pd.DataFrame(list(buf))
                 sg = self.strategies[sym].analyze(df)
                 if sg.signal.value == "BUY":

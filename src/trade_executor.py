@@ -1,6 +1,4 @@
-"""
-Trade Executor: order placement, position tracking. Uses market orders for instant fills.
-"""
+"""Trade Executor: MARKET BUY + OCO SELL (TP + SL on exchange)."""
 
 from __future__ import annotations
 
@@ -23,16 +21,10 @@ class TradeExecutor:
         qty = Decimal(str(quantity))
         return float((qty // step) * step)
 
-    @staticmethod
-    def calculate_quantity(balance: float, price: float) -> float:
-        cfg = get_config()
-        trade_amount = balance * (cfg.bot.trade_amount_pct / 100)
-        return trade_amount / price
-
     def open_position(
         self, symbol: str, price: float, stop_loss: float, take_profit: float
     ) -> bool:
-        """Open position using MARKET BUY for instant execution."""
+        """MARKET BUY, then OCO SELL (TP + SL) on exchange."""
         cfg = get_config()
         session = get_session()
 
@@ -43,7 +35,7 @@ class TradeExecutor:
         )
         if existing:
             session.close()
-            logger.warning(f"Position already open for {symbol}")
+            logger.warning(f"Position exists: {symbol}")
             return False
 
         balance = bc.get_account_balance("USDT")
@@ -52,12 +44,10 @@ class TradeExecutor:
         info = bc.get_symbol_info(symbol)
         if trade_amount < info.get("min_notional", 10):
             session.close()
-            logger.warning(
-                f"Trade amount {trade_amount:.2f} < min_notional for {symbol}"
-            )
+            logger.warning(f"Amount {trade_amount:.2f} < min")
             return False
 
-        # Market buy with quoteOrderQty — spend exact USDT
+        # Step 1: MARKET BUY
         order = bc.place_market_buy(symbol, trade_amount)
         if not order:
             session.close()
@@ -66,16 +56,19 @@ class TradeExecutor:
         fills = order.get("fills", [])
         if not fills:
             session.close()
-            logger.error(f"No fills for {symbol} market buy")
+            logger.error(f"No fills: {symbol}")
             return False
 
         total_qty = sum(float(f["qty"]) for f in fills)
         total_cost = sum(float(f["qty"]) * float(f["price"]) for f in fills)
         avg_price = total_cost / total_qty if total_qty > 0 else price
 
+        # Step 2: OCO SELL (stop-loss + take-profit on exchange!)
+        sl_order = bc.place_oco_sell(symbol, total_qty, take_profit, stop_loss)
+
+        # Save buy order
         db_order = Order(
             order_id=str(order.get("orderId", "")),
-            client_order_id=order.get("clientOrderId", ""),
             symbol=symbol,
             side="BUY",
             order_type="MARKET",
@@ -88,6 +81,7 @@ class TradeExecutor:
         )
         session.add(db_order)
 
+        # Create position record
         position = Position(
             symbol=symbol,
             side="LONG",
@@ -103,23 +97,21 @@ class TradeExecutor:
         session.close()
 
         logger.info(
-            f"Position OPENED: {symbol} qty={total_qty:.6f} entry={avg_price:.2f} SL={stop_loss:.2f} TP={take_profit:.2f}"
+            f"POSITION: {symbol} qty={total_qty:.6f} @ {avg_price:.2f} SL={stop_loss:.2f} TP={take_profit:.2f} OCO={'OK' if sl_order else 'FAIL'}"
         )
         return True
 
     def close_position(
         self, position: Position, exit_price: float, reason: str = "manual"
     ) -> bool:
-        """Close position using MARKET SELL. Checks balance first."""
+        """Close position: check balance, then MARKET SELL."""
         session = get_session()
         qty = float(position.quantity)
-
-        # Verify we actually have the asset
         asset = position.symbol.replace("USDT", "")
-        actual_balance = bc.get_account_balance(asset)
-        if actual_balance < qty:
+        actual = bc.get_account_balance(asset)
+        if actual < qty:
             logger.error(
-                f"Insufficient {asset}: have {actual_balance:.6f}, need {qty:.6f} — marking as closed"
+                f"Insufficient {asset}: have {actual:.6f} need {qty:.6f} — marking closed"
             )
             position.status = "CLOSED"
             position.closed_at = datetime.now(timezone.utc)
@@ -130,18 +122,16 @@ class TradeExecutor:
         order = bc.place_market_sell(position.symbol, qty)
         if not order:
             session.close()
-            logger.error(f"Failed to close {position.symbol}")
+            logger.error(f"Close failed: {position.symbol}")
             return False
 
         fills = order.get("fills", [])
         total_qty = sum(float(f["qty"]) for f in fills)
-        total_revenue = sum(float(f["qty"]) * float(f["price"]) for f in fills)
-        avg_exit_price = total_revenue / total_qty if total_qty > 0 else exit_price
+        total_rev = sum(float(f["qty"]) * float(f["price"]) for f in fills)
+        avg_exit = total_rev / total_qty if total_qty > 0 else exit_price
+        pnl = (avg_exit - float(position.entry_price)) * total_qty
 
-        entry = float(position.entry_price)
-        pnl = (avg_exit_price - entry) * total_qty
-
-        position.current_price = avg_exit_price
+        position.current_price = avg_exit
         position.realized_pnl = pnl
         position.status = "CLOSED"
         position.closed_at = datetime.now(timezone.utc)
@@ -151,20 +141,17 @@ class TradeExecutor:
             symbol=position.symbol,
             side="SELL",
             order_type="MARKET",
-            price=avg_exit_price,
+            price=avg_exit,
             orig_qty=qty,
             executed_qty=total_qty,
-            cummulative_quote_qty=total_revenue,
+            cummulative_quote_qty=total_rev,
             status=order.get("status", "FILLED"),
             strategy=position.strategy,
         )
         session.add(db_order)
         session.commit()
         session.close()
-
-        logger.info(
-            f"Position CLOSED: {position.symbol} PnL={pnl:.4f} USDT reason={reason}"
-        )
+        logger.info(f"CLOSED: {position.symbol} PnL={pnl:.4f} reason={reason}")
         return True
 
     def emergency_close_all(self) -> int:
@@ -173,8 +160,7 @@ class TradeExecutor:
         closed = 0
         for pos in positions:
             asset = pos.symbol.replace("USDT", "")
-            actual_balance = bc.get_account_balance(asset)
-            if actual_balance < float(pos.quantity):
+            if bc.get_account_balance(asset) < float(pos.quantity):
                 pos.status = "CLOSED"
                 pos.closed_at = datetime.now(timezone.utc)
                 closed += 1

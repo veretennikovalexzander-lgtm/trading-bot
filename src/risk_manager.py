@@ -144,3 +144,24 @@ class RiskManager:
             logger.warning(f"YELLOW breaker: ATR {atr_pct:.1f}%")
             return True
         return False
+
+    def check_price_crash_red(self, symbol: str, current_price: float, price_1h_ago: float) -> bool:
+        """-5% in 1h -> RED breaker (full stop)."""
+        if price_1h_ago > 0:
+            change_pct = ((current_price - price_1h_ago) / price_1h_ago) * 100
+            if change_pct <= -5:
+                self.breaker_level = BreakerLevel.RED
+                self.breaker_until = None  # Permanent until restart
+                logger.critical(f"RED BREAKER: {symbol} dropped {change_pct:.1f}% in 1h! FULL STOP.")
+                return True
+        return False
+
+    def check_price_decline_orange(self, symbol: str, current_price: float, price_1h_ago: float) -> bool:
+        """-2.5% in 1h -> ORANGE breaker (pause 60 min)."""
+        if price_1h_ago > 0:
+            change_pct = ((current_price - price_1h_ago) / price_1h_ago) * 100
+            if change_pct <= -2.5 and self.breaker_level == BreakerLevel.NONE:
+                self.update_pause_if_needed(BreakerLevel.ORANGE, 60)
+                logger.warning(f"ORANGE BREAKER: {symbol} dropped {change_pct:.1f}% in 1h. Pause 60 min.")
+                return True
+        return False

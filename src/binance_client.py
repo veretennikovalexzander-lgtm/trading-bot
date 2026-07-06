@@ -164,3 +164,38 @@ def transfer_to_funding(asset: str, amount: float) -> bool:
     except Exception as e:
         logger.error(f"TRANSFER failed {asset}: {e}")
         return False
+
+def place_oco_sell(symbol: str, quantity: float, take_profit_price: float, stop_loss_price: float) -> dict | None:
+    """Place OCO sell order: limit take-profit + stop-loss-limit.
+    If OCO fails, falls back to stop-loss-limit only."""
+    try:
+        from binance.enums import SIDE_SELL
+        # Use create_oco_order for spot
+        order = get_client().create_oco_order(
+            symbol=symbol,
+            side=SIDE_SELL,
+            quantity=quantity,
+            price=round(take_profit_price, 2),
+            stopPrice=round(stop_loss_price, 2),
+            stopLimitPrice=round(stop_loss_price * 0.999, 2),
+            stopLimitTimeInForce="GTC",
+        )
+        logger.info(f"OCO SELL: {symbol} qty={quantity} TP={take_profit_price} SL={stop_loss_price}")
+        return order
+    except Exception as e:
+        logger.error(f"OCO failed for {symbol}: {e}, trying stop-loss only")
+        try:
+            order = get_client().create_order(
+                symbol=symbol,
+                side="SELL",
+                type="STOP_LOSS_LIMIT",
+                quantity=quantity,
+                price=round(stop_loss_price * 0.999, 2),
+                stopPrice=round(stop_loss_price, 2),
+                timeInForce="GTC",
+            )
+            logger.info(f"STOP LOSS: {symbol} qty={quantity} SL={stop_loss_price}")
+            return order
+        except Exception as e2:
+            logger.error(f"Stop-loss failed for {symbol}: {e2}")
+            return None
