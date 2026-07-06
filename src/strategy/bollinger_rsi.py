@@ -22,7 +22,7 @@ def _get_bb_columns(df_bb):
 
 class BollingerRSIStrategy(BaseStrategy):
     def __init__(self, symbol: str, interval: str = "1m", bb_length: int = 20,
-                 bb_std: float = 2.0, rsi_length: int = 14, rsi_oversold: int = 35,
+                 bb_std: float = 2.0, rsi_length: int = 14, rsi_oversold: int = 40,
                  rsi_strict: int = 30, atr_length: int = 14, risk_multiplier: float = 1.5,
                  use_strict_filter: bool = False, debug: bool = False):
         super().__init__(symbol, interval)

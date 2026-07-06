@@ -235,7 +235,7 @@ class MarketPoller:
                 if rsi_series is not None and not pd.isna(rsi_series.iloc[-1])
                 else 0
             )
-            sig = "BUY" if lower and close_price <= lower and rsi_val < 35 else "HOLD"
+            sig = "BUY" if lower and close_price <= lower and rsi_val < 40 else "HOLD"
 
             # Get position info
             pos_str = ""
