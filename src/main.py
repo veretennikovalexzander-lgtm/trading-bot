@@ -84,11 +84,12 @@ class BCtrl:
         self.candles: dict[str, deque] = {}
         self.strategies: dict[str, BollingerRSIStrategy] = {}
         self.lsnap = datetime.min.replace(tzinfo=timezone.utc)
-        self.lstatus = datetime.min.replace(tzinfo=timezone.utc)
+        self.lstatus: dict[str, datetime] = {}  # Per-symbol status log timer
         self.lct: dict[str, int] = {}
         for s in get_config().bot.symbols:
             self.candles[s] = deque(maxlen=MC)
             self.strategies[s] = BollingerRSIStrategy(symbol=s, interval=I)
+            self.lstatus[s] = datetime.min.replace(tzinfo=timezone.utc)
         self._lp()
 
     def _lp(self):
@@ -262,10 +263,12 @@ class BCtrl:
                 buf.append(c)
             if len(buf) < 25:
                 return
-            # Verbose every 60s
+            # Verbose every 60s per symbol
             now = datetime.now(timezone.utc)
-            if (now - self.lstatus).total_seconds() >= 60:
-                self.lstatus = now
+            if (
+                now - self.lstatus.get(sym, datetime.min.replace(tzinfo=timezone.utc))
+            ).total_seconds() >= 60:
+                self.lstatus[sym] = now
                 df = pd.DataFrame(list(buf))
                 try:
                     import pandas_ta as ta
