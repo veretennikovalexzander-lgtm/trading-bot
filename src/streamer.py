@@ -123,7 +123,7 @@ class WebSocketStreamer:
         else:
             kline = msg.get("k", {})
         if not kline or not kline.get("x", False):  # Only closed candles
-        if self._msg_count % 60 == 0: logger.debug(f"Non-closed kline: {kline.get("s","?")}")
+            if self._msg_count % 60 == 0: logger.debug(f"Non-closed kline")
             return
 
         symbol = kline.get("s", "")
