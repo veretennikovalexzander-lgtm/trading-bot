@@ -57,7 +57,7 @@ class WebSocketStreamer:
         for p in s.query(PositionModel).filter(PositionModel.status == "OPEN").all():
             asset = p.symbol.replace("USDT", "")
             bal = get_account_balance(asset)
-            if bal < float(p.quantity) * 0.5:
+            if bal < float(p.quantity) * 0.98:
                 px = get_current_price(p.symbol)
                 pnl = (px - float(p.entry_price)) * float(p.quantity)
                 p.current_price = px
@@ -144,7 +144,7 @@ class WebSocketStreamer:
         if pos:
             asset = sym.replace("USDT", "")
             bal = get_account_balance(asset)
-            if bal < float(pos.quantity) * 0.5 and float(pos.quantity) > 0:
+            if bal < float(pos.quantity) * 0.98 and float(pos.quantity) > 0:
                 pnl = (px - float(pos.entry_price)) * float(pos.quantity)
                 pos.current_price = px; pos.realized_pnl = pnl
                 pos.status = "CLOSED"; pos.closed_at = datetime.now(timezone.utc)
