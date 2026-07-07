@@ -58,6 +58,7 @@ async def run_bot_async():
     controller.started_at = datetime.now(timezone.utc)
     watchdog.start()
     streamer.load_history()
+    streamer.sync_positions()
     controller.write_status(
         {
             "profit_btc": profit_manager.total_btc,

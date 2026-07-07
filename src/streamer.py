@@ -8,11 +8,11 @@ from datetime import datetime, timezone
 
 import pandas as pd
 from loguru import logger
-from src.binance_client import get_account_balance, get_client
+from src.binance_client import get_account_balance, get_client, get_current_price
 from src.config import get_config
 from src.controller import BotController
 from src.database import get_session
-from src.models import MarketData
+from src.models import MarketData, Position as PositionModel
 from src.models import Position as PositionModel
 
 INTERVAL = "1m"
@@ -46,6 +46,27 @@ class WebSocketStreamer:
             self._last_status_log[symbol] = datetime.min.replace(tzinfo=timezone.utc)
 
     def load_history(self):
+    def sync_positions(self):
+        """Sync DB positions with exchange: close in DB if asset was sold."""
+        session = get_session()
+        positions = session.query(PositionModel).filter(PositionModel.status == "OPEN").all()
+        for pos in positions:
+            asset = pos.symbol.replace("USDT", "")
+            balance = get_account_balance(asset)
+            if balance < float(pos.quantity) * 0.5:
+                price = get_current_price(pos.symbol)
+                pnl = (price - float(pos.entry_price)) * float(pos.quantity)
+                pos.current_price = price
+                pos.realized_pnl = pnl
+                pos.status = "CLOSED"
+                pos.closed_at = datetime.now(timezone.utc)
+                logger.info(f"Sync-closed {pos.symbol}: OCO executed while bot was offline. PnL={pnl:.2f}")
+                self.controller.risk_manager.record_trade(pnl)
+                self.controller.trades_count += 1
+                if pnl > 0:
+                    self.profit_manager.fix(pnl, pos.symbol)
+        session.commit()
+        session.close()
         client = get_client()
         for symbol in self.controller.candles:
             try:
